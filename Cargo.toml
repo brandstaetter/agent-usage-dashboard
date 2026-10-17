@@ -20,7 +20,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 thiserror = "2.0"
 time = { version = "=0.3.55", features = ["parsing"] }
-tokio = { version = "=1.53.1", features = ["rt", "time"] }
+tokio = { version = "=1.53.1", features = ["process", "rt", "time"] }
 toml = "1.1"
 uuid = { version = "1.18", features = ["v4"] }
 

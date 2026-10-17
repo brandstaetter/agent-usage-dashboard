@@ -1088,3 +1088,31 @@ fn config_persistence_save_failure_is_sanitized_and_retains_dirty_state() {
     assert_eq!(error.to_string(), "provider preferences could not be saved");
     assert!(!error.to_string().contains("not-a-directory"));
 }
+
+#[test]
+fn visible_providers_without_snapshots_show_waiting_message() {
+    let mut state = DashboardState {
+        windows: project_windows(
+            &[stored(
+                1,
+                Provider::GitHubCopilot,
+                WindowKind::Monthly,
+                10.0,
+                None,
+                NOW,
+                Quality::Fresh,
+            )],
+            &AppConfig::default(),
+            NOW,
+        ),
+        ..DashboardState::default()
+    };
+    for entry in &mut state.providers {
+        entry.visible = entry.provider == Provider::Claude;
+    }
+
+    let screen = rendered(&state);
+    assert!(screen.contains("No quota snapshots yet for Claude"));
+    assert!(screen.contains("Press m to show other providers"));
+    assert!(!screen.contains("GitHub Copilot windows"));
+}
