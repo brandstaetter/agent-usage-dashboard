@@ -416,3 +416,41 @@ fn exposed_errors_are_stable_classes_without_provider_text() {
             .all(|error| !error.to_string().contains("raw-detail-marker"))
     );
 }
+
+struct SpawningFactory;
+
+impl QuotaClientFactory for SpawningFactory {
+    fn start(
+        &self,
+        _program: CopilotProgram,
+    ) -> ClientFuture<'_, Result<Box<dyn QuotaClient>, CopilotError>> {
+        Box::pin(async move {
+            let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--list")
+                .stdout(std::process::Stdio::null())
+                .status()
+                .await
+                .map_err(|_| CopilotError::Spawn)?;
+            assert!(status.success());
+            Ok(Box::new(FakeClient {
+                trace: Arc::new(FakeTrace::default()),
+                rpc: FakeBehavior::Ok(one_quota()),
+                stop: FakeBehavior::Ok(()),
+            }) as Box<dyn QuotaClient>)
+        })
+    }
+}
+
+#[test]
+fn adapter_runtime_can_spawn_the_copilot_child_process() {
+    let adapter = CopilotAdapter::with_factory(
+        CopilotProgram::Bundled,
+        Arc::new(SpawningFactory),
+        CopilotTimeouts::default(),
+    )
+    .unwrap();
+
+    let observation = adapter.read_quota(OBSERVED_AT).unwrap();
+
+    assert_eq!(observation.snapshots.len(), 1);
+}

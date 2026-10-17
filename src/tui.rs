@@ -443,11 +443,33 @@ pub fn render(frame: &mut Frame<'_>, state: &DashboardState) {
                     .any(|window| window.provider == *provider)
             })
             .collect();
-        let panel_areas =
-            Layout::vertical(vec![Constraint::Fill(1); providers.len()]).split(areas[1]);
+        if providers.is_empty() {
+            let visible: Vec<_> = state
+                .providers
+                .iter()
+                .filter(|entry| entry.visible)
+                .map(|entry| provider_label(entry.provider))
+                .collect();
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "No quota snapshots yet for {}. Press m to show other providers.",
+                    visible.join(", ")
+                ))
+                .style(Style::default().fg(Color::DarkGray))
+                .block(
+                    Block::default()
+                        .title(" Provider windows ")
+                        .borders(Borders::ALL),
+                ),
+                areas[1],
+            );
+        } else {
+            let panel_areas =
+                Layout::vertical(vec![Constraint::Fill(1); providers.len()]).split(areas[1]);
 
-        for (provider, area) in providers.into_iter().zip(panel_areas.iter().copied()) {
-            render_provider_panel(frame, area, provider, &state.windows);
+            for (provider, area) in providers.into_iter().zip(panel_areas.iter().copied()) {
+                render_provider_panel(frame, area, provider, &state.windows);
+            }
         }
     }
     frame.render_widget(

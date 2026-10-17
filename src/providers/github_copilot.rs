@@ -219,6 +219,7 @@ impl CopilotAdapter {
         timeouts: CopilotTimeouts,
     ) -> Result<Self, CopilotError> {
         let runtime = Builder::new_current_thread()
+            .enable_io()
             .enable_time()
             .build()
             .map_err(|_| CopilotError::Spawn)?;
