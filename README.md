@@ -18,7 +18,7 @@ Claude Code and Antigravity can each supply one bounded status-line JSON value. 
 - For Claude data, Claude Code 2.1.251 or newer and an account for which `rate_limits` is present. Claude may omit it until after the first API response or when the account is ineligible.
 - For Copilot data, an active Copilot entitlement and Copilot CLI enabled by any organization that supplies it. Install the official CLI, verify `copilot --version`, then launch `copilot` and use `/login` when prompted.
 - For Antigravity data, install and authenticate the official `agy` CLI, then configure its status line to invoke the dashboard. The dashboard does not support a Gemini CLI provider: Google ended consumer-tier Gemini CLI access on June 18, 2026 and directs affected individuals to Antigravity.
-- For Mistral Vibe data, install and sign in to Mistral Vibe, then add one `post_llm` hook that invokes the dashboard (see below).
+- For Mistral Vibe data, install and sign in to Mistral Vibe so its bundled `vibe-app-server` is on `PATH` (or pass `--vibe-app-server PATH`). The monthly subscription budget is then polled automatically; an optional `post_llm` hook adds per-call context usage (see below).
 
 The pinned Copilot SDK includes a version-matched runtime. Its build script downloads and embeds the runtime and supporting assets, so first builds download more data and release artifacts are larger than a dashboard without Copilot support.
 
@@ -46,6 +46,7 @@ agent-usage-dashboard relay claude -- COMMAND [ARG ...]
 agent-usage-dashboard relay antigravity -- COMMAND [ARG ...]
 agent-usage-dashboard refresh codex [--executable PATH]
 agent-usage-dashboard refresh copilot
+agent-usage-dashboard refresh vibe
 agent-usage-dashboard watch codex [--executable PATH]
 agent-usage-dashboard watch copilot
 agent-usage-dashboard history [--limit 50]
@@ -53,9 +54,9 @@ agent-usage-dashboard config show
 agent-usage-dashboard config save
 ```
 
-With no subcommand, the dashboard opens and starts independent bounded Codex and Copilot workers (60 and 300 seconds by default). Use `--no-codex-poll` or `--no-copilot-poll` to disable either worker; use both for a fully offline dashboard. Each `refresh` command performs one read-only refresh, and each `watch` command is its non-TUI continuous form.
+With no subcommand, the dashboard opens and starts independent bounded Codex, Copilot, and Mistral Vibe workers (60, 300, and 300 seconds by default). Use `--no-codex-poll`, `--no-copilot-poll`, or `--no-vibe-poll` to disable a worker; use all three for a fully offline dashboard. Each `refresh` command performs one read-only refresh, and each `watch` command is its non-TUI continuous form.
 
-Global options control Codex/Copilot refresh intervals, Claude, Antigravity, and Mistral Vibe staleness, the Vibe context-window denominator, retention, alert thresholds, native notifications, paths, the Codex executable, and the advanced Copilot runtime override. Run `agent-usage-dashboard --help` for the complete list. Global options such as `--copilot-runtime PATH` and `--antigravity-stale-after-seconds N` appear before the subcommand.
+Global options control Codex/Copilot/Vibe refresh intervals, Claude, Antigravity, and Mistral Vibe staleness, the Vibe context-window denominator, retention, alert thresholds, native notifications, paths, the Codex executable, and the advanced Copilot runtime override. Run `agent-usage-dashboard --help` for the complete list. Global options such as `--copilot-runtime PATH` and `--antigravity-stale-after-seconds N` appear before the subcommand.
 
 Copilot-specific controls are `--copilot-refresh-seconds N` (60–3600, default 300), `--no-copilot-poll`, and advanced-only `--copilot-runtime PATH`. Only the cadence is persisted; disabling polling and an exact runtime path are process-local choices.
 
@@ -81,6 +82,7 @@ The settings file contains only:
 ```toml
 codex_refresh_seconds = 60
 copilot_refresh_seconds = 300
+vibe_refresh_seconds = 300
 claude_stale_after_seconds = 900
 antigravity_stale_after_seconds = 900
 vibe_stale_after_seconds = 900
@@ -131,9 +133,11 @@ The command consumes one bounded JSON document and prints only a sanitized accep
 
 To preserve an existing formatter, configure `agent-usage-dashboard relay antigravity -- COMMAND [ARG ...]`. The child is launched directly without a shell; its stdout, stderr, and exit status remain authoritative. The selected formatter receives the complete original status JSON, including sensitive fields, so use only a formatter you trust. See the [setup guide](docs/installation-and-agent-setup.md) for installation, authentication, JSON configuration, PATH recovery, and safe fixture verification.
 
-## Mistral Vibe hook integration
+## Mistral Vibe integration
 
-Mistral Vibe has no status-line feature. Instead, its hook system runs a command with one JSON document on standard input after every model call. Add a hook to `~/.vibe/hooks.toml` (or a trusted project's `.vibe/hooks.toml`):
+**Subscription usage (automatic).** The dashboard reads your monthly Vibe Code allowance — the same gauge as Vibe's footer — from Vibe's own local app server. It spawns `vibe-app-server` directly (no shell), opens a throwaway `ephemeral` session that Vibe neither persists nor counts, sends `account/read`, and exits. Vibe makes the billing call with its own credentials; the dashboard sees only the usage percentage, reset time, and pay-as-you-go flag. The panel shows a `Monthly · Vibe code` row with its reset countdown, refreshed every `vibe_refresh_seconds` (60–3600, default 300). Run `agent-usage-dashboard refresh vibe` once to verify. `--vibe-app-server PATH` overrides the program (process-local, never persisted) and `--no-vibe-poll` disables the worker. The budget is only reported while Vibe's active model is a Mistral model and the account may view organization usage; otherwise health shows `unavailable`.
+
+**Context usage (optional hook).** Vibe's hook system runs a command with one JSON document on standard input after every model call. To also see per-call context-window usage, add a hook to `~/.vibe/hooks.toml` (or a trusted project's `.vibe/hooks.toml`):
 
 ```toml
 [[hooks]]
@@ -142,7 +146,7 @@ type = "post_llm"
 command = "agent-usage-dashboard ingest vibe"
 ```
 
-The ingest command parses each payload the same bounded way as the other push providers. It reads only the event name, an optional model alias used as the panel scope, and the usage token total; session identifiers, transcript paths, prompts, and responses are never read or stored. Because Vibe publishes no quota windows or resets, the Mistral Vibe panel shows the last call's token count as a percentage of the `vibe_context_window` setting (default 262,144 tokens; accepted range 4,096–10,000,000) with percentage-tinted styling but no reset time. The panel is stale-aware, so an idle Vibe goes stale after `vibe_stale_after_seconds` (default 900). There is no `relay vibe`, `refresh vibe`, or `watch vibe`; the hook fires itself while Vibe is in use. See the [setup guide](docs/installation-and-agent-setup.md) for absolute-path forms, private data directories, and verification.
+The ingest command parses each payload the same bounded way as the other push providers. It reads only the event name, an optional model alias used as the panel scope, and the usage token total; session identifiers, transcript paths, prompts, and responses are never read or stored. These rows show the last call's token count as a percentage of the `vibe_context_window` setting (default 262,144 tokens; accepted range 4,096–10,000,000), with no reset time, and go stale after `vibe_stale_after_seconds` (default 900) when Vibe is idle. See the [setup guide](docs/installation-and-agent-setup.md) for absolute-path forms, private data directories, and verification.
 
 ## Alerts, history, and local data
 
@@ -165,7 +169,8 @@ The precise resolved default varies by OS; `--config-file` and `--data-dir` are 
 - **Antigravity reports `oversize` or `parse`:** the dashboard rejected input over 1 MiB or a malformed/wrong-product quota document. It never stores the raw error body. An invalid bucket can be skipped while valid siblings persist; missing or relative-only reset data is shown as partial.
 - **Antigravity reports `wrapped_command`:** the trusted formatter failed or exited unsuccessfully. Run it directly, verify its path and arguments, and remember that formatter output/exit remains authoritative even when local ingestion fails.
 - **Antigravity is stale or empty:** it is push-only. An empty quota observation updates health without inventing rows, and old rows naturally become stale. Run `/usage` and trigger a subsequent status-line update.
-- **No Mistral Vibe rows:** confirm `vibe --version` resolves, restart Vibe after editing its hooks file, run at least one turn, and confirm the hook command and dashboard use the same `--data-dir`. The panel also goes stale when Vibe is idle.
+- **No Mistral Vibe budget row:** run `agent-usage-dashboard refresh vibe`. `spawn` means `vibe-app-server` is not on `PATH` (pass `--vibe-app-server`); `unavailable` means Vibe reported no budget (non-Mistral active model, self-hosted platform, or no permission to view organization usage); `timeout` means the app server did not answer within 30 seconds.
+- **No Mistral Vibe context rows:** confirm `vibe --version` resolves, restart Vibe after editing its hooks file, run at least one turn, and confirm the hook command and dashboard use the same `--data-dir`. These rows go stale when Vibe is idle.
 - **Mistral Vibe reports `parse`:** the payload was not one JSON object, not a `post_llm` event, or its usage/model fields were unusable. Errors never echo payload contents. Check the hooks file location and `vibe_context_window` bounds.
 - **Copilot `/usage` differs:** the interactive `/usage` screen reports the current CLI session's statistics. The dashboard reads account-level monthly quota through the supported account-quota RPC, so the values answer different questions.
 - **Stale or expired row:** this is intentional; elapsed wall time never claims a quota reset. A fresh provider observation is required.
@@ -198,8 +203,8 @@ Live-provider release smoke checklist (requires your authenticated local tools a
 3. Configure Claude's status line as above, perform a Claude request, then confirm live Claude 5-hour and weekly rows render in the same dashboard.
 4. Configure Antigravity's status line, open `/usage`, cause the next status-line update, and confirm current/history/health and stale behavior. This authenticated check is advisory and remains unclaimed until a maintainer runs it.
 5. Confirm ages update, values do not falsely recover after reset time, and `history --limit 10` contains only normalized quota fields.
-6. Add the Mistral Vibe hook as above, run a short Vibe turn, then confirm the Mistral Vibe panel renders live context usage and healthy push-ingest state.
-7. Repeat with `--no-codex-poll` and `--no-copilot-poll` and confirm the corresponding provider acquisition is disabled while stored rows and push-ingested health remain visible.
+6. Run `agent-usage-dashboard refresh vibe` and confirm a `Monthly · Vibe code` row with a reset time that matches Vibe's footer. Optionally add the hook, run a short Vibe turn, and confirm context rows render.
+7. Repeat with `--no-codex-poll`, `--no-copilot-poll`, and `--no-vibe-poll` and confirm the corresponding provider acquisition is disabled while stored rows and push-ingested health remain visible.
 
 Automated tests use sanitized fixtures, temporary paths, and fake clients only; they do not access authentication or use the network. Authenticated Copilot and Antigravity rendering checks remain advisory manual release gates and must not be claimed from fixture-only tests.
 

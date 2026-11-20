@@ -5,3 +5,4 @@ pub mod claude;
 pub mod codex;
 pub mod github_copilot;
 pub mod vibe;
+pub mod vibe_account;

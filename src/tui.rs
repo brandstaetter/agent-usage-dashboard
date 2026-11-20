@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::{
     config::{AppConfig, ProviderPreferences},
+    dashboard_poll::PollToggles,
     domain::{Availability, LimitKind, Provider},
     storage::{Storage, StoredSnapshot},
     time_format::{format_age_millis, format_duration_seconds, format_snapshot_reset},
@@ -100,18 +101,11 @@ impl DashboardState {
         storage: &Storage,
         config: &AppConfig,
         now_millis: i64,
-        codex_polling_enabled: bool,
-        copilot_polling_enabled: bool,
+        polling: PollToggles,
     ) -> Self {
         match storage.latest_snapshots() {
             Ok(snapshots) => {
-                let poll_status = poll_status(
-                    storage,
-                    &snapshots,
-                    now_millis,
-                    codex_polling_enabled,
-                    copilot_polling_enabled,
-                );
+                let poll_status = poll_status(storage, &snapshots, now_millis, polling);
                 Self {
                     windows: project_windows(&snapshots, config, now_millis),
                     error: None,
@@ -205,10 +199,9 @@ fn poll_status(
     storage: &Storage,
     snapshots: &[StoredSnapshot],
     now_millis: i64,
-    codex_enabled: bool,
-    copilot_enabled: bool,
+    polling: PollToggles,
 ) -> String {
-    let codex = provider_poll_status(storage, Provider::Codex, "Codex", now_millis, codex_enabled);
+    let codex = provider_poll_status(storage, Provider::Codex, "Codex", now_millis, polling.codex);
     let claude = provider_ingest_status(
         storage,
         Provider::Claude,
@@ -221,7 +214,7 @@ fn poll_status(
         Provider::GitHubCopilot,
         "Copilot",
         now_millis,
-        copilot_enabled,
+        polling.copilot,
     );
     let antigravity = provider_ingest_status(
         storage,
@@ -230,6 +223,11 @@ fn poll_status(
         latest_observed_at(snapshots, Provider::GoogleAntigravity),
         now_millis,
     );
+    if polling.vibe {
+        // The subscription budget is polled; hook rows share the same health.
+        let vibe = provider_poll_status(storage, Provider::MistralVibe, "Vibe", now_millis, true);
+        return format!("Poll: {codex} · {copilot} · {vibe} | Ingest: {claude} · {antigravity}");
+    }
     let vibe = provider_ingest_status(
         storage,
         Provider::MistralVibe,
@@ -336,13 +334,7 @@ pub fn project_windows(
             let row = snapshot.as_input();
             let age_millis = now_millis.saturating_sub(row.observed_at).max(0);
             let age_seconds = age_millis / 1_000;
-            let stale_after = match row.provider {
-                Provider::Codex => (config.codex_refresh_seconds * 2).max(180),
-                Provider::Claude => config.claude_stale_after_seconds,
-                Provider::GitHubCopilot => (config.copilot_refresh_seconds * 2).max(180),
-                Provider::GoogleAntigravity => config.antigravity_stale_after_seconds,
-                Provider::MistralVibe => config.vibe_stale_after_seconds,
-            } as i64;
+            let stale_after = config.stale_after_seconds(row) as i64;
             let reset_expired = row
                 .resets_at
                 .is_some_and(|reset| reset <= now_millis / 1_000);
@@ -640,16 +632,9 @@ pub fn run(
     storage: Storage,
     config: AppConfig,
     config_path: PathBuf,
-    codex_polling_enabled: bool,
-    copilot_polling_enabled: bool,
+    polling: PollToggles,
 ) -> Result<(), TuiError> {
-    runtime::run(
-        storage,
-        config,
-        config_path,
-        codex_polling_enabled,
-        copilot_polling_enabled,
-    )
+    runtime::run(storage, config, config_path, polling)
 }
 
 #[cfg(test)]

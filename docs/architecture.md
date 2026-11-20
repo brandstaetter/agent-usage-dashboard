@@ -45,7 +45,10 @@ Antigravity status-line stdin -> Relay/Ingest CLI -+
 - `providers::antigravity` owns bounded typed parsing of one status-line JSON
   object and independently validates dynamic quota buckets.
 - `providers::vibe` owns bounded typed parsing of one Mistral Vibe `post_llm`
-  hook payload.
+  hook payload (per-call context usage).
+- `providers::vibe_account` owns the bounded read-only `vibe-app-server`
+  JSON-RPC sequence that reads the monthly Vibe Code subscription budget. It
+  reuses the Codex child transport (direct spawn, bounded lines, no shell).
 - `domain` owns provider-independent validation and normalization.
 - `storage` is the only SQLite caller. It receives normalized values, never raw JSON.
 - `alerts` evaluates transitions against persisted alert state; it does not poll.
@@ -275,14 +278,52 @@ defaults to 900 seconds, and is bounded to 60–86,400 seconds. The dashboard ma
 no Google HTTP call and does not read Antigravity settings, keyrings, environment
 credentials, browser state, histories, projects, or account identifiers.
 
+## Mistral Vibe subscription-budget contract
+
+Vibe's monthly Vibe Code allowance (the gauge in Vibe's footer) is served by its
+local app server. The dashboard directly spawns `vibe-app-server` (overridable
+with the process-local `--vibe-app-server PATH`; never persisted) with no
+arguments, in the OS temporary directory so no project-level `.vibe`
+configuration or hooks of the dashboard's working directory apply, and speaks
+newline-delimited JSON-RPC over stdio:
+
+1. `initialize` with dashboard `clientInfo`;
+2. the `initialized` notification with `params: {}`;
+3. `session/start` with `kind: "ephemeral"` and `sessionOnly: true`. Vibe
+   documents ephemeral sessions as throwaway: no new-session telemetry, never
+   counted as a session, and nothing is persisted because no turn runs;
+4. `account/read` with that transient session id;
+5. stdin is closed; the server exits on EOF (about 0.4 s observed), and is
+   killed only after a 3-second grace.
+
+Vibe itself performs the Mistral billing calls with its own credentials; the
+dashboard sends no HTTP request and handles no credential. Each response line is
+bounded to 256 KiB and at most 256 messages are examined per request. Only
+`account.status` and `account.budget.{usagePercentage, resetAt, paygEnabled}`
+are deserialized; the plan, API-key preview, identity, and session state are
+skipped by the typed decoder. The session id is validated (1-128 ASCII
+alphanumerics, `-`, `_`), used once in memory, and never stored.
+
+`usagePercentage` (0-100) becomes one limited `WindowKind::Monthly` row with
+scope `vibe_code`, `resets_at` from RFC 3339 `resetAt` (fresh quality when
+present, partial otherwise), and `used_percent` clamped to 100. Availability is
+`blocked` at or above 100% without pay-as-you-go and `allowed` otherwise.
+A status other than `ready` or a missing budget (non-Mistral active model,
+self-hosted platform, or a member without the usage permission) is the
+`unavailable` failure class. Other classes are `spawn`, `transport`,
+`timeout`, `protocol`, `rpc`, and `storage`; none carries provider text.
+
+The dashboard polls this every `vibe_refresh_seconds` (default 300, 60-3600)
+in a supervised worker; `--no-vibe-poll` disables it, and `refresh vibe` reads
+once. Budget rows go stale after `max(2 * vibe interval, 3 minutes)`.
+
 ## Mistral Vibe hook-payload ingestion contract
 
-Mistral Vibe is a push-only provider with no status-line feature. Instead, Vibe's
-hook system runs a user-configured command with one JSON object on stdin at each
-`post_llm` boundary (one per model call, including subagent calls). The dashboard
-exposes `ingest vibe` only; it does not expose relay, refresh, watch, or polling
-modes and does not launch `vibe`. The user authors hook entries in Vibe's own
-TOML format; the dashboard never edits `~/.vibe/hooks.toml` or any Vibe file.
+Separately, Vibe's hook system runs a user-configured command with one JSON
+object on stdin at each `post_llm` boundary (one per model call, including
+subagent calls). This optional feed adds per-call context-window usage beside
+the subscription budget. The user authors hook entries in Vibe's own TOML
+format; the dashboard never edits `~/.vibe/hooks.toml` or any Vibe file.
 
 The adapter reads at most 1 MiB and uses a narrow typed envelope. Only
 `hook_event_name`, the optional `model` alias, and `usage.total_tokens` are
@@ -302,10 +343,10 @@ permit-listed token-count denominator bounded to 4,096-10,000,000 (default
 262,144). Vibe publishes no quota windows, resets, or availability signals, so
 availability is never inferred from token counts.
 
-Durable Vibe health reuses `provider_state` with push-ingest attempts,
-successes, and the `oversize`, `parse`, and `storage` failure classes. The
-configured stale threshold defaults to 900 seconds and is bounded to 60-86,400
-seconds. The dashboard makes no Mistral HTTP call and does not read
+Durable Vibe health reuses `provider_state` (shared by the budget poller and the
+hook) with the `oversize`, `parse`, and `storage` ingest failure classes. Hook
+rows go stale after `vibe_stale_after_seconds` (default 900, bounded to
+60-86,400). The dashboard makes no Mistral HTTP call and does not read
 `~/.vibe` config, session logs, histories, `.env`, keyrings, browser state, or
 account identifiers.
 
@@ -430,9 +471,10 @@ failures are reduced to `spawn`, `timeout`, `not_authenticated`, `not_entitled`,
 Freshness is based on `observed_at`, never inferred from `resets_at`. Codex becomes
 stale after `max(2 * interval, 3 minutes)`; Claude after 15 minutes by default
 (configurable), because it cannot be polled. Copilot uses the same polling rule,
-`max(2 * copilot interval, 3 minutes)`. Antigravity and Mistral Vibe are also
+`max(2 * copilot interval, 3 minutes)`, as does the Mistral Vibe subscription
+budget with its own interval. Antigravity and Mistral Vibe hook rows are
 push-only and become stale after 15 minutes by default (`vibe_stale_after_seconds`
-for Vibe), each configurable from 60 through 86,400 seconds.
+for Vibe hook rows), each configurable from 60 through 86,400 seconds.
 The TUI displays age and last error,
 keeps the last good values, and never advances percentages locally. A known future
 reset may count down visually, but crossing it marks the row expired/stale rather
@@ -603,21 +645,27 @@ visible as partial; empty observations do not fabricate zero usage.
    `/usage` scraping, headless prompts, Antigravity settings/history discovery,
    and direct Google APIs. Those alternatives are unstable, consume quota, or
    cross credential/product boundaries.
-6. **Mistral Vibe acquisition. Chosen: documented bounded hook-payload
-   ingestion via Vibe's `post_llm` hook.** It is the only bounded stdin-JSON feed
-   Vibe exposes; it carries token usage but no server quota windows or resets.
-   Rejected: direct Mistral billing/usage HTTP calls (dashboard boundary:
-   no provider HTTP or credential handling), reading `~/.vibe` session logs,
-   caches, or `meta.json` (transcript/history/identity boundary), and a
-   speculative status-line contract Vibe does not implement.
+6. **Mistral Vibe acquisition. Chosen: read-only `vibe-app-server`
+   `account/read` for the monthly subscription budget, plus optional
+   `post_llm` hook ingestion for per-call context usage.** The app server is
+   Vibe's own local stdio interface, mirroring the Codex app-server model; Vibe
+   keeps its credentials and network calls. Rejected: direct Mistral
+   `/v1/billing/*` HTTP calls (dashboard boundary: no provider HTTP or
+   credential handling), reading `~/.vibe` caches such as `whoami_cache.json`,
+   session logs, or `meta.json` (identity/history boundary), and a speculative
+   status-line contract Vibe does not implement.
 
 ## Verified facts, assumptions, and sources
 
 Verified from the shipped Mistral Vibe 3.1.3 installation (`vibe config schema`
 and bundled built-ins): Vibe implements no status line; its hook system supplies
 one JSON document per `post_llm` boundary carrying `usage` token counters and
-must run a user-configured command. Vibe's billing-derived monthly usage gauge
-is internal to the CLI footer and is not exposed through any local interface.
+must run a user-configured command. Its bundled `vibe-app-server` serves
+`account/read`, whose `budget` (`usagePercentage`, `resetAt`, `paygEnabled`)
+is the monthly Vibe Code allowance Vibe reads from `/v1/billing/budget`;
+`account/read` requires a session id, and `session/start` accepts
+`kind: "ephemeral"`. Assumption: `usagePercentage` is on a 0-100 scale, per
+its name; the field is not in Mistral's public documentation.
 Verified from official documentation/upstream source: the Codex handshake ordering,
 newline JSON transport, method name and response window fields; sparse update
 semantics; Claude stdin/status-line execution model, update/cancellation behavior,

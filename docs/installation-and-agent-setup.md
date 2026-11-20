@@ -25,8 +25,9 @@ explicit command or edit you control.
 - For Antigravity data, the official `agy` CLI authenticated by the user. Google
   ended consumer-tier Gemini CLI access on June 18, 2026, so the dashboard does
   not implement a Gemini CLI provider.
-- For Mistral Vibe data, Mistral Vibe 3.1.0 or newer with a configured
-  `post_llm` hook (set up below).
+- For Mistral Vibe data, Mistral Vibe 3.1.3 or newer, signed in, with its
+  bundled `vibe-app-server` on `PATH`; optionally a `post_llm` hook for
+  context usage (set up below).
 
 The Copilot SDK's default feature downloads and embeds a version-matched runtime
 and supporting assets during the build. Expect the initial build/download and
@@ -589,12 +590,31 @@ Troubleshooting:
 
 ## Mistral Vibe setup
 
-Mistral Vibe has no status-line feature. Instead, Vibe's hook system can run a
-command with one JSON document on standard input after every model call. The
-dashboard's `ingest vibe` command parses that hook payload the same bounded way
-as `ingest claude` and `ingest antigravity`.
+### Subscription budget (no setup needed)
 
-### Configure the hook
+The dashboard polls your monthly Vibe Code allowance from Vibe's own
+`vibe-app-server` every `vibe_refresh_seconds` (default 300, 60-3600). Verify:
+
+```text
+vibe-app-server --help
+agent-usage-dashboard refresh vibe
+```
+
+The second command prints, for example, `Mistral Vibe: Vibe code 20.8% used,
+79.2% left`; compare it with the usage shown in Vibe's footer. If
+`vibe-app-server` is not on `PATH`, pass the absolute path with
+`--vibe-app-server PATH` (process-local, never persisted). `--no-vibe-poll`
+disables the dashboard worker. A health class of `unavailable` means Vibe
+reported no budget: the active model is not a Mistral model, the platform does
+not serve billing, or the account lacks permission to view organization usage.
+
+### Optional: per-call context usage hook
+
+Vibe's hook system can also run a command with one JSON document on standard
+input after every model call. The dashboard's `ingest vibe` command parses that
+hook payload the same bounded way as `ingest claude` and `ingest antigravity`.
+
+#### Configure the hook
 
 Add one hook to `~/.vibe/hooks.toml` (or a trusted project's
 `.vibe/hooks.toml`):
@@ -628,10 +648,9 @@ through 86,400. An explicit override also precedes the subcommand:
 agent-usage-dashboard --vibe-stale-after-seconds 600 ingest vibe
 ```
 
-### What the panel shows
+#### What the hook rows show
 
-Vibe does not publish quota windows the way Codex, Copilot, Claude, or
-Antigravity do, so the Mistral Vibe panel reports context usage: the last call's
+Hook rows report context usage beside the budget row: the last call's
 total token count as a percentage of the model context window in
 `vibe_context_window` (default 262144 tokens, accepted range 4096 through
 10,000,000). There is no reset time; rows are therefore marked partial and the
@@ -643,7 +662,7 @@ reflects the most recently active session.
 agent-usage-dashboard --vibe-context-window 600000 ingest vibe
 ```
 
-### Verify and troubleshoot Vibe ingestion
+#### Verify and troubleshoot Vibe ingestion
 
 1. Confirm `vibe --version` (3.1.0 or newer) and `agent-usage-dashboard --version`
    resolve in a newly opened terminal, then restart Vibe.

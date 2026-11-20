@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::{
     alerts::{AlertEngine, Clock},
     config::{AppConfig, AppPaths, ConfigError, ConfigFileError, PathError},
-    dashboard_poll::{CodexProbe, DashboardPollError, DashboardPoller},
+    dashboard_poll::{CodexProbe, DashboardPollError, DashboardPoller, PollToggles},
     domain::{Provider, QuotaSnapshot, QuotaSnapshotInput, ValidationError, normalize_rows},
     notify::{DesktopNotifier, TerminalNotifier, deliver},
     providers::{
@@ -29,6 +29,7 @@ use crate::{
             MAX_STATUS_INPUT_BYTES as VIBE_MAX_STATUS_INPUT_BYTES, VibeParseError,
             parse_hook_payload as parse_vibe_hook_payload,
         },
+        vibe_account::{VibeAccountAdapter, VibeAccountError, VibeAccountObservation},
     },
     status_line_relay::{self, CapturedInput},
     storage::{Storage, StorageError},
@@ -63,6 +64,9 @@ pub struct Cli {
     /// Google Antigravity observations become stale after this many seconds.
     #[arg(long, global = true)]
     pub antigravity_stale_after_seconds: Option<u64>,
+    /// Mistral Vibe subscription budget polling interval, validated to 60-3600 seconds.
+    #[arg(long, global = true)]
+    pub vibe_refresh_seconds: Option<u64>,
     /// Mistral Vibe observations become stale after this many seconds.
     #[arg(long, global = true)]
     pub vibe_stale_after_seconds: Option<u64>,
@@ -100,6 +104,14 @@ pub struct Cli {
     /// Disable dashboard GitHub Copilot polling for offline operation.
     #[arg(long, global = true)]
     pub no_copilot_poll: bool,
+
+    /// Mistral Vibe app-server program; `vibe-app-server` on PATH when omitted.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub vibe_app_server: Option<PathBuf>,
+
+    /// Disable dashboard Mistral Vibe subscription budget polling.
+    #[arg(long, global = true)]
+    pub no_vibe_poll: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -185,6 +197,8 @@ pub enum RefreshCommand {
     },
     /// Query GitHub Copilot account quota once and persist normalized windows.
     Copilot,
+    /// Query the Mistral Vibe monthly subscription budget once and persist it.
+    Vibe,
 }
 
 #[derive(Debug, Subcommand)]
@@ -206,6 +220,16 @@ trait CopilotProbe {
 impl CopilotProbe for CopilotAdapter {
     fn read(&self, observed_at: i64) -> Result<CopilotObservation, CopilotError> {
         self.read_quota(observed_at)
+    }
+}
+
+trait VibeBudgetProbe {
+    fn read(&self, observed_at: i64) -> Result<VibeAccountObservation, VibeAccountError>;
+}
+
+impl VibeBudgetProbe for VibeAccountAdapter {
+    fn read(&self, observed_at: i64) -> Result<VibeAccountObservation, VibeAccountError> {
+        self.read_budget(observed_at)
     }
 }
 
@@ -231,6 +255,8 @@ pub enum CliError {
     Codex(#[from] CodexError),
     #[error("GitHub Copilot refresh failed: {class}")]
     CopilotRefresh { class: &'static str },
+    #[error("Mistral Vibe refresh failed: {class}")]
+    VibeRefresh { class: &'static str },
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[error(transparent)]
@@ -301,6 +327,8 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
     let no_codex_poll = cli.no_codex_poll;
     let copilot_runtime = cli.copilot_runtime.clone();
     let no_copilot_poll = cli.no_copilot_poll;
+    let vibe_app_server = cli.vibe_app_server.clone();
+    let no_vibe_poll = cli.no_vibe_poll;
     match cli.command.unwrap_or(Command::Dashboard) {
         Command::Dashboard => {
             let storage = Storage::open(paths.database_path())?;
@@ -310,8 +338,12 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
                 paths.config_path(),
                 codex_executable,
                 copilot_runtime,
-                no_codex_poll,
-                no_copilot_poll,
+                vibe_app_server,
+                PollToggles {
+                    codex: !no_codex_poll,
+                    copilot: !no_copilot_poll,
+                    vibe: !no_vibe_poll,
+                },
             )
         }
         Command::Ingest {
@@ -378,6 +410,16 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
             refresh_copilot(&storage, &probe, io::stdout().lock(), now, &config, bell)?;
             Ok(())
         }
+        Command::Refresh {
+            provider: RefreshCommand::Vibe,
+        } => {
+            let storage = Storage::open(paths.database_path())?;
+            let now = now_millis()?;
+            let probe = VibeAccountAdapter::new(vibe_app_server);
+            let bell = io::stdout().is_terminal();
+            refresh_vibe(&storage, &probe, io::stdout().lock(), now, &config, bell)?;
+            Ok(())
+        }
         Command::Watch {
             provider: WatchCommand::Codex { executable },
         } => watch::run_codex(storage_at(&paths)?, executable, config),
@@ -426,20 +468,18 @@ fn run_dashboard(
     config_path: PathBuf,
     executable: PathBuf,
     copilot_runtime: Option<PathBuf>,
-    no_codex_poll: bool,
-    no_copilot_poll: bool,
+    vibe_app_server: Option<PathBuf>,
+    toggles: PollToggles,
 ) -> Result<(), CliError> {
-    let codex_enabled = !no_codex_poll;
-    let copilot_enabled = !no_copilot_poll;
     let poller = DashboardPoller::start(
         storage.clone(),
         executable,
         copilot_runtime,
+        vibe_app_server,
         config.clone(),
-        codex_enabled,
-        copilot_enabled,
+        toggles,
     )?;
-    let dashboard_result = tui::run(storage, config, config_path, codex_enabled, copilot_enabled);
+    let dashboard_result = tui::run(storage, config, config_path, toggles);
     let poll_result = poller.stop_and_join();
     dashboard_result?;
     poll_result?;
@@ -462,6 +502,9 @@ fn merged_config(mut config: AppConfig, cli: &Cli) -> Result<AppConfig, CliError
     }
     if let Some(value) = cli.antigravity_stale_after_seconds {
         config.antigravity_stale_after_seconds = value;
+    }
+    if let Some(value) = cli.vibe_refresh_seconds {
+        config.vibe_refresh_seconds = value;
     }
     if let Some(value) = cli.vibe_stale_after_seconds {
         config.vibe_stale_after_seconds = value;
@@ -835,6 +878,56 @@ fn refresh_copilot<W: Write>(
         .record_provider_success(crate::domain::Provider::GitHubCopilot, observed_at)
         .map_err(|_| copilot_refresh_error(storage, observed_at, "storage"))?;
     Ok(batch.accepted)
+}
+
+fn refresh_vibe<W: Write>(
+    storage: &Storage,
+    probe: &impl VibeBudgetProbe,
+    mut writer: W,
+    observed_at: i64,
+    config: &AppConfig,
+    bell: bool,
+) -> Result<Vec<QuotaSnapshot>, CliError> {
+    storage
+        .record_provider_attempt(Provider::MistralVibe, observed_at)
+        .map_err(|_| vibe_refresh_error(storage, observed_at, "storage"))?;
+    let observation = probe
+        .read(observed_at)
+        .map_err(|error| vibe_refresh_error(storage, observed_at, error.class()))?;
+    let batch = normalize_rows(observation.snapshots);
+    storage
+        .insert_snapshots(&batch.accepted)
+        .map_err(|_| vibe_refresh_error(storage, observed_at, "storage"))?;
+    writeln!(
+        writer,
+        "{}",
+        concise_summary("Mistral Vibe", &batch.accepted)
+    )?;
+    if let Err(error) = finish_observation(
+        storage,
+        &batch.accepted,
+        config,
+        observed_at,
+        &mut writer,
+        bell,
+    ) {
+        return match error {
+            CliError::Storage(_) => Err(vibe_refresh_error(storage, observed_at, "storage")),
+            other => {
+                let _ = storage.record_provider_success(Provider::MistralVibe, observed_at);
+                Err(other)
+            }
+        };
+    }
+    storage
+        .record_provider_success(Provider::MistralVibe, observed_at)
+        .map_err(|_| vibe_refresh_error(storage, observed_at, "storage"))?;
+    Ok(batch.accepted)
+}
+
+fn vibe_refresh_error(storage: &Storage, attempted_at: i64, class: &'static str) -> CliError {
+    let _ = storage.record_provider_failure(Provider::MistralVibe, attempted_at, class);
+    CliError::VibeRefresh { class }
 }
 
 fn copilot_refresh_error(storage: &Storage, attempted_at: i64, class: &'static str) -> CliError {

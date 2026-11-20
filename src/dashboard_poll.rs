@@ -16,6 +16,7 @@ use crate::{
     providers::{
         codex::{CodexAdapter, CodexError, CodexObservation},
         github_copilot::{CopilotAdapter, CopilotError, CopilotObservation},
+        vibe_account::{VibeAccountAdapter, VibeAccountError, VibeAccountObservation},
     },
     storage::Storage,
 };
@@ -40,6 +41,24 @@ impl CopilotProbe for CopilotAdapter {
     }
 }
 
+pub trait VibeProbe: Send + Sync + 'static {
+    fn read(&self, observed_at: i64) -> Result<VibeAccountObservation, VibeAccountError>;
+}
+
+impl VibeProbe for VibeAccountAdapter {
+    fn read(&self, observed_at: i64) -> Result<VibeAccountObservation, VibeAccountError> {
+        self.read_budget(observed_at)
+    }
+}
+
+/// Which supervised in-dashboard pollers are enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollToggles {
+    pub codex: bool,
+    pub copilot: bool,
+    pub vibe: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum DashboardPollError {
     #[error("unable to initialize the GitHub Copilot dashboard poller: {class}")]
@@ -59,12 +78,17 @@ impl DashboardPoller {
         storage: Storage,
         executable: PathBuf,
         copilot_runtime: Option<PathBuf>,
+        vibe_app_server: Option<PathBuf>,
         config: AppConfig,
-        codex_enabled: bool,
-        copilot_enabled: bool,
+        toggles: PollToggles,
     ) -> Result<Self, DashboardPollError> {
-        let codex_probe = codex_enabled.then(|| Arc::new(CodexAdapter::new(executable)));
-        let copilot_probe = if copilot_enabled {
+        let codex_probe = toggles
+            .codex
+            .then(|| Arc::new(CodexAdapter::new(executable)));
+        let vibe_probe = toggles
+            .vibe
+            .then(|| Arc::new(VibeAccountAdapter::new(vibe_app_server)));
+        let copilot_probe = if toggles.copilot {
             Some(Arc::new(CopilotAdapter::new(copilot_runtime).map_err(
                 |error| DashboardPollError::CopilotInitialization {
                     class: error.class(),
@@ -73,24 +97,49 @@ impl DashboardPoller {
         } else {
             None
         };
-        Self::start_with(storage, codex_probe, copilot_probe, config, SystemClock)
+        Self::start_with(
+            storage,
+            codex_probe,
+            copilot_probe,
+            vibe_probe,
+            config,
+            SystemClock,
+        )
     }
 
-    fn start_with<CP, GP, C>(
+    fn start_with<CP, GP, VP, C>(
         storage: Storage,
         codex_probe: Option<Arc<CP>>,
         copilot_probe: Option<Arc<GP>>,
+        vibe_probe: Option<Arc<VP>>,
         config: AppConfig,
         clock: C,
     ) -> Result<Self, DashboardPollError>
     where
         CP: CodexProbe,
         GP: CopilotProbe,
+        VP: VibeProbe,
         C: Clock + Clone + Send + Sync + 'static,
     {
         let mut poller = Self {
-            workers: Vec::with_capacity(2),
+            workers: Vec::with_capacity(3),
         };
+        if let Some(probe) = vibe_probe {
+            let worker_storage = storage.clone();
+            let worker_config = config.clone();
+            let worker_clock = clock.clone();
+            poller
+                .workers
+                .push(PollWorker::spawn("Mistral Vibe", move |stop| {
+                    run_vibe_poll_loop(
+                        &worker_storage,
+                        probe.as_ref(),
+                        &worker_config,
+                        &worker_clock,
+                        stop.as_ref(),
+                    );
+                })?);
+        }
         if let Some(probe) = codex_probe {
             let worker_storage = storage.clone();
             let worker_config = config.clone();
@@ -259,6 +308,50 @@ fn run_copilot_poll_loop<P: CopilotProbe>(
             break;
         }
     }
+}
+
+fn run_vibe_poll_loop<P: VibeProbe>(
+    storage: &Storage,
+    probe: &P,
+    config: &AppConfig,
+    clock: &impl Clock,
+    wait: &impl PollWait,
+) {
+    let interval = Duration::from_secs(config.vibe_refresh_seconds);
+    while !wait.stopped() {
+        poll_vibe_once(storage, probe, config, clock);
+        if wait.wait(interval) {
+            break;
+        }
+    }
+}
+
+fn poll_vibe_once(
+    storage: &Storage,
+    probe: &impl VibeProbe,
+    config: &AppConfig,
+    clock: &impl Clock,
+) {
+    let now = clock.now_millis();
+    if storage
+        .record_provider_attempt(Provider::MistralVibe, now)
+        .is_err()
+    {
+        return;
+    }
+    let observation = match probe.read(now) {
+        Ok(observation) => observation,
+        Err(error) => {
+            let _ = storage.record_provider_failure(Provider::MistralVibe, now, error.class());
+            return;
+        }
+    };
+    let batch = normalize_rows(observation.snapshots);
+    if persist_success(storage, &batch.accepted, config, clock).is_err() {
+        let _ = storage.record_provider_failure(Provider::MistralVibe, now, "storage");
+        return;
+    }
+    let _ = storage.record_provider_success(Provider::MistralVibe, now);
 }
 
 fn poll_codex_once(

@@ -8,6 +8,8 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::domain::{Provider, QuotaSnapshotInput, WindowKind};
+
 pub const MIN_CODEX_REFRESH_SECONDS: u64 = 30;
 pub const MAX_CODEX_REFRESH_SECONDS: u64 = 15 * 60;
 pub const MIN_COPILOT_REFRESH_SECONDS: u64 = 60;
@@ -16,6 +18,8 @@ pub const MIN_CLAUDE_STALE_SECONDS: u64 = 60;
 pub const MAX_CLAUDE_STALE_SECONDS: u64 = 24 * 60 * 60;
 pub const MIN_ANTIGRAVITY_STALE_SECONDS: u64 = 60;
 pub const MAX_ANTIGRAVITY_STALE_SECONDS: u64 = 24 * 60 * 60;
+pub const MIN_VIBE_REFRESH_SECONDS: u64 = 60;
+pub const MAX_VIBE_REFRESH_SECONDS: u64 = 60 * 60;
 pub const MIN_VIBE_STALE_SECONDS: u64 = 60;
 pub const MAX_VIBE_STALE_SECONDS: u64 = 24 * 60 * 60;
 pub const MIN_VIBE_CONTEXT_WINDOW: u64 = 4_096;
@@ -36,6 +40,8 @@ pub struct AppConfig {
     pub claude_stale_after_seconds: u64,
     #[serde(default = "default_antigravity_stale_after_seconds")]
     pub antigravity_stale_after_seconds: u64,
+    #[serde(default = "default_vibe_refresh_seconds")]
+    pub vibe_refresh_seconds: u64,
     #[serde(default = "default_vibe_stale_after_seconds")]
     pub vibe_stale_after_seconds: u64,
     #[serde(default = "default_vibe_context_window")]
@@ -109,6 +115,7 @@ impl Default for AppConfig {
             copilot_refresh_seconds: default_copilot_refresh_seconds(),
             claude_stale_after_seconds: 15 * 60,
             antigravity_stale_after_seconds: default_antigravity_stale_after_seconds(),
+            vibe_refresh_seconds: default_vibe_refresh_seconds(),
             vibe_stale_after_seconds: default_vibe_stale_after_seconds(),
             vibe_context_window: default_vibe_context_window(),
             retention_days: 30,
@@ -121,6 +128,24 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Seconds after which a stored row is considered stale. Polled rows use
+    /// twice their polling interval (at least three minutes); pushed rows use
+    /// their provider's configured staleness. Mistral Vibe has both: the
+    /// polled monthly subscription budget and pushed per-call context rows.
+    pub fn stale_after_seconds(&self, row: &QuotaSnapshotInput) -> u64 {
+        let polled = |interval: u64| (interval * 2).max(180);
+        match row.provider {
+            Provider::Codex => polled(self.codex_refresh_seconds),
+            Provider::Claude => self.claude_stale_after_seconds,
+            Provider::GitHubCopilot => polled(self.copilot_refresh_seconds),
+            Provider::GoogleAntigravity => self.antigravity_stale_after_seconds,
+            Provider::MistralVibe if row.window_kind == WindowKind::Monthly => {
+                polled(self.vibe_refresh_seconds)
+            }
+            Provider::MistralVibe => self.vibe_stale_after_seconds,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_range(
             "codex_refresh_seconds",
@@ -145,6 +170,12 @@ impl AppConfig {
             self.antigravity_stale_after_seconds,
             MIN_ANTIGRAVITY_STALE_SECONDS,
             MAX_ANTIGRAVITY_STALE_SECONDS,
+        )?;
+        validate_range(
+            "vibe_refresh_seconds",
+            self.vibe_refresh_seconds,
+            MIN_VIBE_REFRESH_SECONDS,
+            MAX_VIBE_REFRESH_SECONDS,
         )?;
         validate_range(
             "vibe_stale_after_seconds",
@@ -227,6 +258,10 @@ const fn default_copilot_refresh_seconds() -> u64 {
 
 const fn default_antigravity_stale_after_seconds() -> u64 {
     15 * 60
+}
+
+const fn default_vibe_refresh_seconds() -> u64 {
+    300
 }
 
 const fn default_vibe_stale_after_seconds() -> u64 {

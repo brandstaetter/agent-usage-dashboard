@@ -1,26 +1,42 @@
 use super::*;
 
-pub(super) struct ChildTransport {
+/// Bounded newline-delimited JSON-RPC transport over a directly spawned child.
+/// The program and argv are fixed by the caller; no shell is involved.
+pub(crate) struct ChildTransport {
     child: Child,
     stdin: Option<ChildStdin>,
     receiver: Receiver<Result<Vec<u8>, TransportError>>,
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
+    shutdown_grace: Duration,
     stopped: bool,
 }
 
 impl ChildTransport {
     pub(super) fn spawn(executable: &Path) -> Result<Self, CodexError> {
-        let mut child = Command::new(executable)
-            .args(["app-server", "--listen", "stdio://"])
+        Self::spawn_with(executable, &["app-server", "--listen", "stdio://"], None)
+            .map_err(|_| CodexError::Spawn)
+    }
+
+    /// Spawns `executable` with exactly `args`, optionally in `current_dir`.
+    pub(crate) fn spawn_with(
+        executable: &Path,
+        args: &[&str],
+        current_dir: Option<&Path>,
+    ) -> Result<Self, TransportError> {
+        let mut command = Command::new(executable);
+        command
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|_| CodexError::Spawn)?;
-        let stdin = child.stdin.take().ok_or(CodexError::Spawn)?;
-        let stdout = child.stdout.take().ok_or(CodexError::Spawn)?;
-        let stderr = child.stderr.take().ok_or(CodexError::Spawn)?;
+            .stderr(Stdio::piped());
+        if let Some(directory) = current_dir {
+            command.current_dir(directory);
+        }
+        let mut child = command.spawn().map_err(|_| TransportError::Io)?;
+        let stdin = child.stdin.take().ok_or(TransportError::Io)?;
+        let stdout = child.stdout.take().ok_or(TransportError::Io)?;
+        let stderr = child.stderr.take().ok_or(TransportError::Io)?;
         let (sender, receiver) = mpsc::sync_channel(MAX_MESSAGES_PER_REQUEST);
         let stdout_thread = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -72,8 +88,16 @@ impl ChildTransport {
             receiver,
             stdout_thread: Some(stdout_thread),
             stderr_thread: Some(stderr_thread),
+            shutdown_grace: Duration::from_millis(100),
             stopped: false,
         })
+    }
+
+    /// How long shutdown waits for a clean exit after closing stdin before
+    /// the child is killed.
+    pub(crate) fn with_shutdown_grace(mut self, grace: Duration) -> Self {
+        self.shutdown_grace = grace;
+        self
     }
 }
 
@@ -113,7 +137,7 @@ impl LineTransport for ChildTransport {
         }
         self.stopped = true;
         self.stdin.take();
-        let deadline = Instant::now() + Duration::from_millis(100);
+        let deadline = Instant::now() + self.shutdown_grace;
         while Instant::now() < deadline {
             match self.child.try_wait() {
                 Ok(Some(_)) => break,

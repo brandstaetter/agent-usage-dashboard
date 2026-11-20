@@ -47,6 +47,10 @@ Antigravity invokes the user-configured status-line command and supplies one JSO
 
 Authentication and Google network access remain entirely under `agy` control. The user launches `agy` and completes its browser/keyring sign-in. The dashboard does not open Antigravity settings, inspect the OS keyring, scan environment credentials, invoke authentication, or contact Google. Raw status JSON exists briefly in bounded process memory and, in relay mode, is also passed to the user-selected formatter before being discarded.
 
+### Mistral Vibe: read-only app-server budget read
+
+For the monthly Vibe Code subscription budget the dashboard directly spawns Vibe's own `vibe-app-server` (no shell) in the OS temporary directory and sends exactly `initialize`, `initialized`, an `ephemeral` `session/start`, and `account/read`, then closes stdin. Vibe performs the billing request with its own credentials; the dashboard never sees or handles them and makes no HTTP call. Only the account status and the budget's usage percentage, reset time, and pay-as-you-go flag are decoded; the plan name, API-key preview, identity, and the transient session id are never stored, logged, or echoed in errors.
+
 ### Mistral Vibe: bounded hook-payload input
 
 Mistral Vibe has no status-line feature. The user configures a Vibe `post_llm` hook that runs `ingest vibe`, and Vibe supplies one JSON object on standard input after each model call. `ingest vibe` accepts at most 1 MiB, inspects only `hook_event_name`, an optional `model` alias used as the shown scope key, and `usage.total_tokens`, then discards the input. The dashboard never reads, retains, or stores Vibe session or conversation identifiers, transcript paths, working directory, prompts, responses, or any other payload field, and never opens `~/.vibe` configuration, session logs, or history files.
@@ -73,7 +77,7 @@ The database also keeps bounded operational state:
 - Provider health: `provider`, `last_success_at`, `last_attempt_at`, `consecutive_failures`, and `last_error_class`. Raw error text is not stored.
 - Alert deduplication: `provider`, `scope_key`, `window_kind`, `alert_kind`, `cycle_key`, and `fired_at`.
 
-The dashboard configuration file is separate from SQLite. Its complete allowlist is `codex_refresh_seconds`, `copilot_refresh_seconds`, `claude_stale_after_seconds`, `antigravity_stale_after_seconds`, `vibe_stale_after_seconds`, `vibe_context_window`, `retention_days`, `low_remaining_percent`, `reset_soon_seconds`, `native_notifications`, and the provider-key arrays `provider_preferences.order` and `provider_preferences.hidden`. The preference arrays control presentation only. The file has no fields for provider credentials, runtime paths, or provider authentication. The Antigravity and Vibe stale thresholds default to 900 seconds and are bounded to 60–86,400 seconds. `vibe_context_window` is a token-count denominator (4096–10,000,000) used to express Vibe usage as a percentage; it contains no secrets.
+The dashboard configuration file is separate from SQLite. Its complete allowlist is `codex_refresh_seconds`, `copilot_refresh_seconds`, `claude_stale_after_seconds`, `antigravity_stale_after_seconds`, `vibe_refresh_seconds`, `vibe_stale_after_seconds`, `vibe_context_window`, `retention_days`, `low_remaining_percent`, `reset_soon_seconds`, `native_notifications`, and the provider-key arrays `provider_preferences.order` and `provider_preferences.hidden`. The preference arrays control presentation only. The file has no fields for provider credentials, runtime paths, or provider authentication. The Antigravity and Vibe stale thresholds default to 900 seconds and are bounded to 60–86,400 seconds. `vibe_context_window` is a token-count denominator (4096–10,000,000) used to express Vibe usage as a percentage; it contains no secrets.
 
 ## What is excluded
 

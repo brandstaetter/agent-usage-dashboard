@@ -246,7 +246,7 @@ pub use parse::parse_rate_limits_result;
 
 #[path = "codex_transport.rs"]
 mod transport;
-use transport::ChildTransport;
+pub(crate) use transport::ChildTransport;
 
 #[cfg(test)]
 #[path = "codex_tests.rs"]

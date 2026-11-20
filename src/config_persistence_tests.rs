@@ -28,6 +28,7 @@ fn config_persistence_round_trip_contains_only_dashboard_settings() {
         copilot_refresh_seconds: 600,
         claude_stale_after_seconds: 1_200,
         antigravity_stale_after_seconds: 1_800,
+        vibe_refresh_seconds: 300,
         vibe_stale_after_seconds: 1_800,
         vibe_context_window: 262_144,
         retention_days: 45,
@@ -240,6 +241,7 @@ fn config_persistence_defaults_vibe_settings_for_legacy_files() {
 fn config_persistence_validates_vibe_staleness_inclusive_bounds() {
     for accepted in [MIN_VIBE_STALE_SECONDS, MAX_VIBE_STALE_SECONDS] {
         AppConfig {
+            vibe_refresh_seconds: 300,
             vibe_stale_after_seconds: accepted,
             ..AppConfig::default()
         }
@@ -248,6 +250,7 @@ fn config_persistence_validates_vibe_staleness_inclusive_bounds() {
     }
     for rejected in [MIN_VIBE_STALE_SECONDS - 1, MAX_VIBE_STALE_SECONDS + 1] {
         let error = AppConfig {
+            vibe_refresh_seconds: 300,
             vibe_stale_after_seconds: rejected,
             ..AppConfig::default()
         }
@@ -309,4 +312,34 @@ fn reconciled(expected: &[(&str, bool)]) -> Vec<ReconciledProvider> {
             visible: *visible,
         })
         .collect()
+}
+
+#[test]
+fn vibe_budget_rows_go_stale_by_poll_cadence_and_hook_rows_by_ingest_window() {
+    use crate::domain::{
+        Availability, LimitKind, Provider, Quality, QuotaSnapshotInput, WindowKind,
+    };
+    let config = AppConfig {
+        vibe_refresh_seconds: 600,
+        vibe_stale_after_seconds: 900,
+        ..AppConfig::default()
+    };
+    let mut row = QuotaSnapshotInput {
+        provider: Provider::MistralVibe,
+        scope_key: "vibe_code".into(),
+        window_kind: WindowKind::Monthly,
+        limit_kind: LimitKind::Limited,
+        window_duration_seconds: None,
+        used_percent: 1.0,
+        resets_at: None,
+        observed_at: 0,
+        availability: Availability::Allowed,
+        source_version: None,
+        quality: Quality::Partial,
+        source_sequence: uuid::Uuid::new_v4(),
+    };
+    assert_eq!(config.stale_after_seconds(&row), 1_200);
+    row.window_kind = WindowKind::Other;
+    assert_eq!(config.stale_after_seconds(&row), 900);
+    assert_eq!(AppConfig::default().vibe_refresh_seconds, 300);
 }

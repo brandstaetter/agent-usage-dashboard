@@ -12,14 +12,13 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use super::{DashboardAction, DashboardState, TuiError, handle_event, render};
-use crate::{config::AppConfig, storage::Storage};
+use crate::{config::AppConfig, dashboard_poll::PollToggles, storage::Storage};
 
 pub(super) fn run(
     storage: Storage,
     config: AppConfig,
     config_path: PathBuf,
-    codex_polling_enabled: bool,
-    copilot_polling_enabled: bool,
+    polling: PollToggles,
 ) -> Result<(), TuiError> {
     let mut session = TerminalSession::enter()?;
     let result = run_loop(
@@ -27,8 +26,7 @@ pub(super) fn run(
         &storage,
         &config,
         &config_path,
-        codex_polling_enabled,
-        copilot_polling_enabled,
+        polling,
     );
     let restore = session.restore();
     result.and(restore)
@@ -39,16 +37,9 @@ fn run_loop(
     storage: &Storage,
     config: &AppConfig,
     config_path: &Path,
-    codex_polling_enabled: bool,
-    copilot_polling_enabled: bool,
+    polling: PollToggles,
 ) -> Result<(), TuiError> {
-    let mut state = DashboardState::load(
-        storage,
-        config,
-        now_millis()?,
-        codex_polling_enabled,
-        copilot_polling_enabled,
-    );
+    let mut state = DashboardState::load(storage, config, now_millis()?, polling);
     let mut last_load = Instant::now();
     loop {
         terminal.draw(|frame| render(frame, &state))?;
@@ -60,13 +51,7 @@ fn run_loop(
             }
         }
         if last_load.elapsed() >= Duration::from_secs(1) {
-            let refreshed = DashboardState::load(
-                storage,
-                config,
-                now_millis()?,
-                codex_polling_enabled,
-                copilot_polling_enabled,
-            );
+            let refreshed = DashboardState::load(storage, config, now_millis()?, polling);
             state.windows = refreshed.windows;
             state.error = refreshed.error;
             state.poll_status = refreshed.poll_status;

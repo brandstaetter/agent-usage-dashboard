@@ -14,7 +14,10 @@ use uuid::Uuid;
 use super::*;
 use crate::{
     domain::{Availability, LimitKind, Quality, QuotaSnapshotInput, WindowKind},
-    providers::github_copilot::{CopilotError, CopilotObservation},
+    providers::{
+        github_copilot::{CopilotError, CopilotObservation},
+        vibe_account::{VibeAccountError, VibeAccountObservation},
+    },
 };
 
 #[derive(Clone, Copy)]
@@ -269,6 +272,7 @@ fn dashboard_polling_shutdown_wakes_and_joins_without_waiting_for_interval() {
         storage,
         Some(Arc::new(probe)),
         Some(Arc::new(copilot_probe)),
+        None::<Arc<FakeVibeProbe>>,
         AppConfig {
             codex_refresh_seconds: 900,
             copilot_refresh_seconds: 3_600,
@@ -342,6 +346,7 @@ fn dashboard_poller_supports_every_selective_disable_combination() {
         storage,
         Some(Arc::new(codex)),
         Some(Arc::new(copilot)),
+        None::<Arc<FakeVibeProbe>>,
         config.clone(),
         FixedClock(1_000),
     )
@@ -359,6 +364,7 @@ fn dashboard_poller_supports_every_selective_disable_combination() {
         storage.clone(),
         Some(codex.clone()),
         None::<Arc<FakeCopilotProbe>>,
+        None::<Arc<FakeVibeProbe>>,
         config.clone(),
         FixedClock(1_000),
     )
@@ -382,6 +388,7 @@ fn dashboard_poller_supports_every_selective_disable_combination() {
         storage.clone(),
         None::<Arc<FakeProbe>>,
         Some(copilot.clone()),
+        None::<Arc<FakeVibeProbe>>,
         config.clone(),
         FixedClock(1_000),
     )
@@ -396,6 +403,7 @@ fn dashboard_poller_supports_every_selective_disable_combination() {
         storage,
         None::<Arc<FakeProbe>>,
         None::<Arc<FakeCopilotProbe>>,
+        None::<Arc<FakeVibeProbe>>,
         config,
         FixedClock(1_000),
     )
@@ -436,6 +444,7 @@ fn stop_and_join_waits_for_in_flight_runtime_and_leaves_no_orphan() {
         storage,
         None::<Arc<FakeProbe>>,
         Some(probe),
+        None::<Arc<FakeVibeProbe>>,
         AppConfig::default(),
         FixedClock(1_000),
     )
@@ -502,6 +511,7 @@ fn worker_failure_is_reported_after_all_workers_are_stopped_and_joined() {
         storage,
         Some(codex),
         Some(Arc::new(PanickingCopilotProbe { called: copilot_tx })),
+        None::<Arc<FakeVibeProbe>>,
         AppConfig {
             codex_refresh_seconds: 900,
             copilot_refresh_seconds: 3_600,
@@ -516,4 +526,100 @@ fn worker_failure_is_reported_after_all_workers_are_stopped_and_joined() {
     let error = poller.stop_and_join().unwrap_err();
     assert!(matches!(error, DashboardPollError::Join("GitHub Copilot")));
     assert!(codex_dropped.load(Ordering::SeqCst));
+}
+
+struct FakeVibeProbe {
+    result: Mutex<Option<Result<VibeAccountObservation, VibeAccountError>>>,
+    called: mpsc::Sender<()>,
+}
+
+impl VibeProbe for FakeVibeProbe {
+    fn read(&self, _observed_at: i64) -> Result<VibeAccountObservation, VibeAccountError> {
+        let result = self
+            .result
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(Err(VibeAccountError::Unavailable));
+        let _ = self.called.send(());
+        result
+    }
+}
+
+fn vibe_budget_row(observed_at: i64) -> QuotaSnapshotInput {
+    QuotaSnapshotInput {
+        provider: Provider::MistralVibe,
+        scope_key: "vibe_code".into(),
+        window_kind: WindowKind::Monthly,
+        limit_kind: LimitKind::Limited,
+        window_duration_seconds: None,
+        used_percent: 20.8,
+        resets_at: Some(1_796_083_200),
+        observed_at,
+        availability: Availability::Allowed,
+        source_version: None,
+        quality: Quality::Fresh,
+        source_sequence: Uuid::new_v4(),
+    }
+}
+
+#[test]
+fn dashboard_vibe_poller_persists_budget_and_records_sanitized_failures() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::open(temp.path().join("vibe.sqlite3")).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let probe = Arc::new(FakeVibeProbe {
+        result: Mutex::new(Some(Ok(VibeAccountObservation {
+            snapshots: vec![vibe_budget_row(1_000)],
+        }))),
+        called: tx,
+    });
+    let poller = DashboardPoller::start_with(
+        storage.clone(),
+        None::<Arc<FakeProbe>>,
+        None::<Arc<FakeCopilotProbe>>,
+        Some(probe),
+        AppConfig::default(),
+        FixedClock(1_000),
+    )
+    .unwrap();
+    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    poller.stop_and_join().unwrap();
+    let latest = storage.latest_snapshots().unwrap();
+    assert_eq!(latest.len(), 1);
+    let row = latest[0].snapshot.as_input();
+    assert_eq!(row.provider, Provider::MistralVibe);
+    assert_eq!(row.window_kind, WindowKind::Monthly);
+    assert_eq!(row.used_percent, 20.8);
+    let state = storage
+        .provider_state(Provider::MistralVibe)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.last_success_at, Some(1_000));
+    assert_eq!(state.consecutive_failures, 0);
+
+    let storage = Storage::open(temp.path().join("vibe-fail.sqlite3")).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let probe = Arc::new(FakeVibeProbe {
+        result: Mutex::new(Some(Err(VibeAccountError::Unavailable))),
+        called: tx,
+    });
+    let poller = DashboardPoller::start_with(
+        storage.clone(),
+        None::<Arc<FakeProbe>>,
+        None::<Arc<FakeCopilotProbe>>,
+        Some(probe),
+        AppConfig::default(),
+        FixedClock(1_000),
+    )
+    .unwrap();
+    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    poller.stop_and_join().unwrap();
+    let state = storage
+        .provider_state(Provider::MistralVibe)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.consecutive_failures, 1);
+    assert_eq!(state.last_error_class.as_deref(), Some("unavailable"));
+    assert!(storage.latest_snapshots().unwrap().is_empty());
 }

@@ -116,6 +116,7 @@ fn config_persistence_cli_applies_only_explicit_overrides() {
         copilot_refresh_seconds: 300,
         claude_stale_after_seconds: 2_400,
         antigravity_stale_after_seconds: 3_000,
+        vibe_refresh_seconds: 300,
         vibe_stale_after_seconds: 3_600,
         vibe_context_window: 262_144,
         retention_days: 90,
@@ -1228,4 +1229,113 @@ fn direct_vibe_failures_are_sanitized_and_record_approved_classes() {
         .unwrap();
     assert_eq!(health.consecutive_failures, 3);
     assert_eq!(health.last_error_class.as_deref(), Some("parse"));
+}
+
+struct FakeVibeBudget(Option<Result<VibeAccountObservation, VibeAccountError>>);
+
+impl VibeBudgetProbe for std::cell::RefCell<FakeVibeBudget> {
+    fn read(&self, _observed_at: i64) -> Result<VibeAccountObservation, VibeAccountError> {
+        self.borrow_mut()
+            .0
+            .take()
+            .unwrap_or(Err(VibeAccountError::Unavailable))
+    }
+}
+
+#[test]
+fn vibe_refresh_cli_parses_and_validates_its_settings() {
+    let parsed = Cli::try_parse_from([
+        "usage",
+        "--vibe-app-server",
+        "custom-vibe-app-server",
+        "--vibe-refresh-seconds",
+        "600",
+        "--no-vibe-poll",
+        "refresh",
+        "vibe",
+    ])
+    .unwrap();
+    assert_eq!(
+        parsed.vibe_app_server.as_deref(),
+        Some(std::path::Path::new("custom-vibe-app-server"))
+    );
+    assert!(parsed.no_vibe_poll);
+    assert!(matches!(
+        parsed.command,
+        Some(Command::Refresh {
+            provider: RefreshCommand::Vibe
+        })
+    ));
+    assert_eq!(
+        merged_config(AppConfig::default(), &parsed)
+            .unwrap()
+            .vibe_refresh_seconds,
+        600
+    );
+    let invalid =
+        Cli::try_parse_from(["usage", "--vibe-refresh-seconds", "59", "dashboard"]).unwrap();
+    assert!(matches!(
+        merged_config(AppConfig::default(), &invalid),
+        Err(CliError::Config(_))
+    ));
+}
+
+#[test]
+fn vibe_refresh_persists_budget_and_sanitizes_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = Storage::open(temp.path().join("usage.sqlite3")).unwrap();
+    let row = QuotaSnapshotInput {
+        provider: Provider::MistralVibe,
+        scope_key: "vibe_code".into(),
+        window_kind: WindowKind::Monthly,
+        limit_kind: LimitKind::Limited,
+        window_duration_seconds: None,
+        used_percent: 42.0,
+        resets_at: Some(1_796_083_200),
+        observed_at: 1_700_000_000_000,
+        availability: Availability::Allowed,
+        source_version: None,
+        quality: Quality::Fresh,
+        source_sequence: uuid::Uuid::new_v4(),
+    };
+    let probe = std::cell::RefCell::new(FakeVibeBudget(Some(Ok(VibeAccountObservation {
+        snapshots: vec![row],
+    }))));
+    let mut output = Vec::new();
+    let accepted = refresh_vibe(
+        &storage,
+        &probe,
+        &mut output,
+        1_700_000_000_000,
+        &AppConfig::default(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert!(String::from_utf8(output).unwrap().contains("Mistral Vibe"));
+    let state = storage
+        .provider_state(Provider::MistralVibe)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.last_success_at, Some(1_700_000_000_000));
+
+    let error = refresh_vibe(
+        &storage,
+        &probe,
+        Vec::new(),
+        1_700_000_001_000,
+        &AppConfig::default(),
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Mistral Vibe refresh failed: unavailable"
+    );
+    let state = storage
+        .provider_state(Provider::MistralVibe)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.consecutive_failures, 1);
+    assert_eq!(state.last_error_class.as_deref(), Some("unavailable"));
 }

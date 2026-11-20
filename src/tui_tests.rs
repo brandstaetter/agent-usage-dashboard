@@ -12,6 +12,14 @@ use crate::domain::{
 
 const NOW: i64 = 1_700_000_000_000;
 
+fn polls(codex: bool, copilot: bool) -> PollToggles {
+    PollToggles {
+        codex,
+        copilot,
+        vibe: false,
+    }
+}
+
 fn stored(
     id: i64,
     provider: Provider,
@@ -764,7 +772,7 @@ fn dashboard_poll_status_reports_providers_independently() {
         .snapshot])
         .unwrap();
 
-    let state = DashboardState::load(&storage, &AppConfig::default(), NOW, true, true);
+    let state = DashboardState::load(&storage, &AppConfig::default(), NOW, polls(true, true));
     assert!(state.poll_status.contains("Poll: Codex ok 5s ago"));
     assert!(state.poll_status.contains("Ingest: Claude seen 7s ago"));
     assert!(state.poll_status.contains("Copilot timeout ×1"));
@@ -777,9 +785,23 @@ fn dashboard_poll_status_reports_providers_independently() {
     );
     assert!(state.poll_status.len() < 120);
 
-    let disabled = DashboardState::load(&storage, &AppConfig::default(), NOW, false, true);
+    let disabled = DashboardState::load(&storage, &AppConfig::default(), NOW, polls(false, true));
     assert!(disabled.poll_status.contains("Codex off"));
     assert!(disabled.poll_status.contains("Copilot timeout ×1"));
+
+    let vibe_polled = DashboardState::load(
+        &storage,
+        &AppConfig::default(),
+        NOW,
+        PollToggles {
+            codex: true,
+            copilot: true,
+            vibe: true,
+        },
+    );
+    let status = &vibe_polled.poll_status;
+    assert!(status.find("Vibe").unwrap() < status.find("Ingest:").unwrap());
+    assert!(!status[status.find("Ingest:").unwrap()..].contains("Vibe"));
 }
 
 #[test]
@@ -790,7 +812,7 @@ fn configured_provider_health_renders_without_an_empty_quota_panel() {
         .record_provider_failure(Provider::GitHubCopilot, NOW - 2_000, "timeout")
         .unwrap();
 
-    let state = DashboardState::load(&storage, &AppConfig::default(), NOW, false, true);
+    let state = DashboardState::load(&storage, &AppConfig::default(), NOW, polls(false, true));
     assert!(state.windows.is_empty());
     let screen = rendered(&state);
     assert!(screen.contains("Poll: Codex off · Copilot timeout ×1"));
@@ -806,7 +828,7 @@ fn antigravity_push_ingest_health_renders_without_polling_or_placeholder_rows() 
         .record_provider_failure(Provider::GoogleAntigravity, NOW - 2_000, "parse")
         .unwrap();
 
-    let state = DashboardState::load(&storage, &AppConfig::default(), NOW, false, false);
+    let state = DashboardState::load(&storage, &AppConfig::default(), NOW, polls(false, false));
     assert!(state.windows.is_empty());
     assert!(
         state
@@ -832,7 +854,7 @@ fn antigravity_health_hides_unapproved_error_classes() {
         )
         .unwrap();
 
-    let state = DashboardState::load(&storage, &AppConfig::default(), NOW, false, false);
+    let state = DashboardState::load(&storage, &AppConfig::default(), NOW, polls(false, false));
     assert!(state.poll_status.contains("Antigravity failed ×1"));
     assert!(!state.poll_status.contains("sentinel-private-body"));
 }
@@ -1051,7 +1073,7 @@ fn config_persistence_restart_restores_provider_order_and_visibility() {
     let temp = tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     let storage = Storage::open(temp.path().join("usage.sqlite3")).unwrap();
-    let mut state = DashboardState::load(&storage, &AppConfig::default(), NOW, false, false);
+    let mut state = DashboardState::load(&storage, &AppConfig::default(), NOW, polls(false, false));
 
     handle_event(&mut state, &key(KeyCode::Char('m')));
     handle_event(&mut state, &key(KeyCode::Down));
@@ -1064,8 +1086,7 @@ fn config_persistence_restart_restores_provider_order_and_visibility() {
         &storage,
         &AppConfig::load(&config_path).unwrap(),
         NOW,
-        false,
-        false,
+        polls(false, false),
     );
     assert_eq!(restarted.providers[0].provider, Provider::Claude);
     assert!(!restarted.providers[0].visible);
