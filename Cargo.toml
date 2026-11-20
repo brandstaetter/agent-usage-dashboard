@@ -1,6 +1,6 @@
 [package]
 name = "agent-usage-dashboard"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 description = "A local dashboard for normalized AI coding-agent quota usage"
@@ -20,7 +20,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 thiserror = "2.0"
 time = { version = "=0.3.55", features = ["parsing"] }
-tokio = { version = "=1.53.1", features = ["process", "rt", "time"] }
+tokio = { version = "=1.53.3", features = ["process", "rt", "time"] }
 toml = "1.1"
 uuid = { version = "1.18", features = ["v4"] }
 
