@@ -48,11 +48,12 @@ pub struct WindowView {
     pub stale: bool,
 }
 
-const PROVIDERS: [Provider; 4] = [
+const PROVIDERS: [Provider; 5] = [
     Provider::Codex,
     Provider::Claude,
     Provider::GitHubCopilot,
     Provider::GoogleAntigravity,
+    Provider::MistralVibe,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,7 +230,14 @@ fn poll_status(
         latest_observed_at(snapshots, Provider::GoogleAntigravity),
         now_millis,
     );
-    format!("Poll: {codex} · {copilot} | Ingest: {claude} · {antigravity}")
+    let vibe = provider_ingest_status(
+        storage,
+        Provider::MistralVibe,
+        "Vibe",
+        latest_observed_at(snapshots, Provider::MistralVibe),
+        now_millis,
+    );
+    format!("Poll: {codex} · {copilot} | Ingest: {claude} · {antigravity} · {vibe}")
 }
 
 fn latest_observed_at(snapshots: &[StoredSnapshot], provider: Provider) -> Option<i64> {
@@ -333,6 +341,7 @@ pub fn project_windows(
                 Provider::Claude => config.claude_stale_after_seconds,
                 Provider::GitHubCopilot => (config.copilot_refresh_seconds * 2).max(180),
                 Provider::GoogleAntigravity => config.antigravity_stale_after_seconds,
+                Provider::MistralVibe => config.vibe_stale_after_seconds,
             } as i64;
             let reset_expired = row
                 .resets_at
@@ -380,6 +389,7 @@ fn provider_order(provider: Provider) -> u8 {
         Provider::Claude => 1,
         Provider::GitHubCopilot => 2,
         Provider::GoogleAntigravity => 3,
+        Provider::MistralVibe => 4,
     }
 }
 

@@ -195,6 +195,7 @@ impl AlertEngine {
             Provider::Claude => self.config.claude_stale_after_seconds,
             Provider::GitHubCopilot => (self.config.copilot_refresh_seconds * 2).max(180),
             Provider::GoogleAntigravity => self.config.antigravity_stale_after_seconds,
+            Provider::MistralVibe => self.config.vibe_stale_after_seconds,
         };
         now_millis.saturating_sub(row.observed_at) <= stale_after as i64 * 1_000
     }

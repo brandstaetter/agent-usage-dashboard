@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::domain::{Provider, QuotaSnapshot, QuotaSnapshotInput, ValidationError, WindowKind};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_HISTORY_LIMIT: usize = 500;
 
@@ -431,23 +431,28 @@ fn validate_history_limit(limit: usize) -> Result<(), StorageError> {
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
-    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current > SCHEMA_VERSION {
         return Err(StorageError::UnsupportedSchemaVersion {
             found: current,
             supported: SCHEMA_VERSION,
         });
     }
+    if current == 1 {
+        migrate_v1_to_v3(connection)?;
+        current = 3;
+    } else if current == 2 {
+        migrate_v2_to_v3(connection)?;
+        current = 3;
+    }
     if current == 0 {
         let transaction = connection.transaction()?;
-        transaction.execute_batch(CREATE_SNAPSHOTS_V3)?;
+        transaction.execute_batch(CREATE_SNAPSHOTS_V4)?;
         transaction.execute_batch(CREATE_SUPPORTING_TABLES)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
-    } else if current == 1 {
-        migrate_v1_to_v3(connection)?;
-    } else if current == 2 {
-        migrate_v2_to_v3(connection)?;
+    } else if current == 3 {
+        migrate_v3_to_v4(connection)?;
     }
     Ok(())
 }
@@ -475,7 +480,7 @@ fn migrate_v1_to_v3(connection: &mut Connection) -> Result<(), StorageError> {
     )?;
     verify_snapshot_count(&transaction, before)?;
     transaction.execute("DROP TABLE snapshots_v1", [])?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.pragma_update(None, "user_version", 3)?;
     transaction.commit()?;
     Ok(())
 }
@@ -503,6 +508,34 @@ fn migrate_v2_to_v3(connection: &mut Connection) -> Result<(), StorageError> {
     )?;
     verify_snapshot_count(&transaction, before)?;
     transaction.execute("DROP TABLE snapshots_v2", [])?;
+    transaction.pragma_update(None, "user_version", 3)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), StorageError> {
+    let transaction = connection.transaction()?;
+    let before: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))?;
+    transaction.execute_batch(
+        "DROP INDEX snapshots_latest;
+         ALTER TABLE snapshots RENAME TO snapshots_v3;",
+    )?;
+    transaction.execute_batch(CREATE_SNAPSHOTS_V4)?;
+    transaction.execute(
+        "INSERT INTO snapshots (
+            id, provider, scope_key, window_kind, limit_kind,
+            window_duration_seconds, used_percent, resets_at, observed_at,
+            availability, source_version, quality, source_sequence
+         )
+         SELECT id, provider, scope_key, window_kind, limit_kind,
+                window_duration_seconds, used_percent, resets_at, observed_at,
+                availability, source_version, quality, source_sequence
+         FROM snapshots_v3",
+        [],
+    )?;
+    verify_snapshot_count(&transaction, before)?;
+    transaction.execute("DROP TABLE snapshots_v3", [])?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -524,6 +557,27 @@ const CREATE_SNAPSHOTS_V3: &str =
     "CREATE TABLE snapshots (
         id INTEGER PRIMARY KEY,
         provider TEXT NOT NULL CHECK (provider IN ('codex','claude','github_copilot','google_antigravity')),
+        scope_key TEXT NOT NULL,
+        window_kind TEXT NOT NULL CHECK (window_kind IN ('rolling_5h','rolling_7d','spend','monthly','other')),
+        limit_kind TEXT NOT NULL CHECK (limit_kind IN ('limited','unlimited')),
+        window_duration_seconds INTEGER,
+        used_percent REAL NOT NULL,
+        resets_at INTEGER,
+        observed_at INTEGER NOT NULL,
+        availability TEXT NOT NULL CHECK (availability IN ('allowed','blocked','unknown')),
+        source_version TEXT,
+        quality TEXT NOT NULL CHECK (quality IN ('fresh','partial')),
+        source_sequence TEXT NOT NULL,
+        CHECK (used_percent >= 0),
+        UNIQUE(provider, scope_key, window_kind, observed_at)
+     );
+     CREATE INDEX snapshots_latest
+        ON snapshots(provider, scope_key, window_kind, observed_at DESC);";
+
+const CREATE_SNAPSHOTS_V4: &str =
+    "CREATE TABLE snapshots (
+        id INTEGER PRIMARY KEY,
+        provider TEXT NOT NULL CHECK (provider IN ('codex','claude','github_copilot','google_antigravity','mistral_vibe')),
         scope_key TEXT NOT NULL,
         window_kind TEXT NOT NULL CHECK (window_kind IN ('rolling_5h','rolling_7d','spend','monthly','other')),
         limit_kind TEXT NOT NULL CHECK (limit_kind IN ('limited','unlimited')),
@@ -984,19 +1038,20 @@ mod tests {
     }
 
     #[test]
-    fn new_v3_schema_accepts_only_the_four_exact_provider_values() {
+    fn new_v4_schema_accepts_only_the_five_exact_provider_values() {
         let (_temp, storage) = fixture_storage();
         let connection = storage.connect().unwrap();
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, SCHEMA_VERSION);
 
         for (index, provider) in [
             Provider::Codex,
             Provider::Claude,
             Provider::GitHubCopilot,
             Provider::GoogleAntigravity,
+            Provider::MistralVibe,
         ]
         .into_iter()
         .enumerate()
@@ -1394,21 +1449,24 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("usage.sqlite3");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 4).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
         drop(connection);
 
+        let unsupported_version = SCHEMA_VERSION + 1;
         assert!(matches!(
             Storage::open(&path),
             Err(StorageError::UnsupportedSchemaVersion {
-                found: 4,
-                supported: 3
-            })
+                found,
+                supported
+            }) if found == unsupported_version && supported == SCHEMA_VERSION
         ));
         let connection = Connection::open(&path).unwrap();
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, unsupported_version);
     }
 
     #[test]

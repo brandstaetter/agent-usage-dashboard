@@ -6,7 +6,7 @@
 ## Goals and non-goals
 
 The application is one local Rust process that shows normalized quota windows
-for Codex, Claude Code, GitHub Copilot, and Google Antigravity, retains a small local history, and
+for Codex, Claude Code, GitHub Copilot, Google Antigravity, and Mistral Vibe, retains a small local history, and
 emits deduplicated local alerts. Provider acquisition, normalization, storage,
 alert evaluation, and presentation are separate boundaries so a provider
 contract change cannot silently redefine stored data.
@@ -44,13 +44,15 @@ Antigravity status-line stdin -> Relay/Ingest CLI -+
   typed account-quota RPC, per-category validation, and sanitized error classes.
 - `providers::antigravity` owns bounded typed parsing of one status-line JSON
   object and independently validates dynamic quota buckets.
+- `providers::vibe` owns bounded typed parsing of one Mistral Vibe `post_llm`
+  hook payload.
 - `domain` owns provider-independent validation and normalization.
 - `storage` is the only SQLite caller. It receives normalized values, never raw JSON.
 - `alerts` evaluates transitions against persisted alert state; it does not poll.
 - `tui` reads query projections and sends refresh intents; it never talks directly
   to a provider. `notify` implements native/terminal outputs behind a trait.
 
-One binary exposes `dashboard` (TUI), `ingest claude|antigravity`,
+One binary exposes `dashboard` (TUI), `ingest claude|antigravity|vibe`,
 `relay claude|antigravity -- COMMAND [ARG...]`, poll-provider `refresh`/`watch`,
 bounded `history`, and permit-listed
 `config` subcommands. Concurrent processes use SQLite WAL mode, a busy
@@ -62,10 +64,11 @@ arrives.
 
 `QuotaSnapshot` contains:
 
-- `provider`: closed enum `codex | claude | github_copilot | google_antigravity`.
+- `provider`: closed enum `codex | claude | github_copilot | google_antigravity | mistral_vibe`.
 - `scope_key`: stable, non-secret provider bucket key. Codex uses a sanitized
   `limitId` when present; Claude uses `subscription`; Copilot uses a bounded
-  runtime-defined quota category; Antigravity uses a bounded dynamic quota key.
+  runtime-defined quota category; Antigravity uses a bounded dynamic quota key;
+  Vibe uses an optional bounded model alias or the constant `session`.
   Never use an account ID.
 - `window_kind`: `rolling_5h | rolling_7d | spend | monthly | other`.
 - `limit_kind`: `limited | unlimited`. Existing Codex/Claude rows and finite
@@ -98,7 +101,7 @@ availability; absence of such metadata must not be interpreted as recovery.
 ```sql
 CREATE TABLE snapshots (
   id INTEGER PRIMARY KEY,
-  provider TEXT NOT NULL CHECK (provider IN ('codex','claude','github_copilot','google_antigravity')),
+  provider TEXT NOT NULL CHECK (provider IN ('codex','claude','github_copilot','google_antigravity','mistral_vibe')),
   scope_key TEXT NOT NULL,
   window_kind TEXT NOT NULL CHECK (window_kind IN ('rolling_5h','rolling_7d','spend','monthly','other')),
   limit_kind TEXT NOT NULL CHECK (limit_kind IN ('limited','unlimited')),
@@ -138,7 +141,10 @@ CREATE TABLE alert_state (
 Migrations use `PRAGMA user_version`. Schema v2 transactionally added Copilot's
 explicit limit classification. Schema v3 transactionally rebuilds the constrained
 snapshot table to permit `google_antigravity`, with direct v1-to-v3 and v2-to-v3
-paths that preserve snapshot values plus provider/alert state. Retention is
+paths that preserve snapshot values plus provider/alert state. Schema v4
+transactionally rebuilds the constrained snapshot table to permit
+`mistral_vibe`, with direct v1-to-v3-to-v4 and v2-to-v3-to-v4 paths that
+preserve snapshot values plus provider/alert state. Retention is
 configurable (default 30 days) and pruning occurs after successful inserts. SQLite and config live under the OS
 application-data directory, not the repository or provider directories.
 
@@ -269,6 +275,40 @@ defaults to 900 seconds, and is bounded to 60–86,400 seconds. The dashboard ma
 no Google HTTP call and does not read Antigravity settings, keyrings, environment
 credentials, browser state, histories, projects, or account identifiers.
 
+## Mistral Vibe hook-payload ingestion contract
+
+Mistral Vibe is a push-only provider with no status-line feature. Instead, Vibe's
+hook system runs a user-configured command with one JSON object on stdin at each
+`post_llm` boundary (one per model call, including subagent calls). The dashboard
+exposes `ingest vibe` only; it does not expose relay, refresh, watch, or polling
+modes and does not launch `vibe`. The user authors hook entries in Vibe's own
+TOML format; the dashboard never edits `~/.vibe/hooks.toml` or any Vibe file.
+
+The adapter reads at most 1 MiB and uses a narrow typed envelope. Only
+`hook_event_name`, the optional `model` alias, and `usage.total_tokens` are
+inspected. `hook_event_name` must be exactly `post_llm`. Session and conversation
+identifiers, transcript paths, working directory, prompts, responses, and all
+other fields are unplumbed: they are never read into domain objects,
+diagnostics, or storage. A missing or null `usage`, or one without a usable
+`total_tokens`, is an empty or rejected observation; a wrong-typed `model` is a
+rejected usage, not a document failure. An optional UTF-8 model alias that
+passes the bounded key validator (`mistral-medium-3.5`) becomes the
+`scope_key`; otherwise the constant `session` is used.
+
+`total_tokens` becomes `used_percent = total_tokens / vibe_context_window *
+100`, clamped to 0..=100, as one limited `WindowKind::Other` row with no reset
+time, unknown availability, and partial quality. `vibe_context_window` is a
+permit-listed token-count denominator bounded to 4,096-10,000,000 (default
+262,144). Vibe publishes no quota windows, resets, or availability signals, so
+availability is never inferred from token counts.
+
+Durable Vibe health reuses `provider_state` with push-ingest attempts,
+successes, and the `oversize`, `parse`, and `storage` failure classes. The
+configured stale threshold defaults to 900 seconds and is bounded to 60-86,400
+seconds. The dashboard makes no Mistral HTTP call and does not read
+`~/.vibe` config, session logs, histories, `.env`, keyrings, browser state, or
+account identifiers.
+
 ## GitHub Copilot account-quota contract
 
 ### Verified SDK surface and lifecycle
@@ -349,7 +389,8 @@ start the SDK runtime.
 
 Trusted: this binary, its config/database, the exact configured `codex`
 executable, the bundled or explicitly overridden Copilot runtime, and locally
-launched Claude/Antigravity status-line invocations and selected formatters.
+launched Claude/Antigravity status-line invocations, selected formatters, and
+Mistral Vibe hook invocations.
 Untrusted: all provider JSON, stderr,
 filesystem paths from environment, database contents after tampering, and
 notification text consumers.
@@ -363,7 +404,7 @@ notification text consumers.
   encryption is not claimed. Treat notification bodies as public screen content.
 - Cap line/input length, nesting, numeric magnitude, pending request count, and
   parse time. Malformed input cannot clear good state or crash the TUI.
-- Never scan Codex/Claude/Copilot/Antigravity config, auth, keychains, history, projects,
+- Never scan Codex/Claude/Copilot/Antigravity/Vibe config, auth, keychains, history, projects,
   repositories, logs, browser profiles, prompts, or transcripts. Provider
   children may inherit or retrieve provider auth under provider control; the
   dashboard does not inspect it.
@@ -389,8 +430,9 @@ failures are reduced to `spawn`, `timeout`, `not_authenticated`, `not_entitled`,
 Freshness is based on `observed_at`, never inferred from `resets_at`. Codex becomes
 stale after `max(2 * interval, 3 minutes)`; Claude after 15 minutes by default
 (configurable), because it cannot be polled. Copilot uses the same polling rule,
-`max(2 * copilot interval, 3 minutes)`. Antigravity is also push-only and becomes
-stale after 15 minutes by default, configurable from 60 through 86,400 seconds.
+`max(2 * copilot interval, 3 minutes)`. Antigravity and Mistral Vibe are also
+push-only and become stale after 15 minutes by default (`vibe_stale_after_seconds`
+for Vibe), each configurable from 60 through 86,400 seconds.
 The TUI displays age and last error,
 keeps the last good values, and never advances percentages locally. A known future
 reset may count down visually, but crossing it marks the row expired/stale rather
@@ -422,7 +464,7 @@ parses provider data. The config stores permit-listed `provider_preferences.orde
 and `provider_preferences.hidden` provider-key arrays. Reconciliation keeps the
 first occurrence of each known configured key, ignores unknown keys, appends newly
 known providers in the default Codex, Claude, GitHub Copilot, Google AI ·
-Antigravity order, and retains hidden providers in the management list. Legacy or
+Antigravity, Mistral Vibe order, and retains hidden providers in the management list. Legacy or
 empty preferences therefore show every provider in the default order.
 
 The TUI applies this order and visibility only when laying out top-level provider
@@ -510,6 +552,10 @@ back to the TUI/bell and record a nonfatal capability message.
   sanitized status fixtures, fake clocks/formatters, and temporary config/data
   paths. They never start `agy`, authenticate, or contact Google. Authenticated
   Antigravity rendering remains an advisory unclaimed manual release gate.
+- Vibe parser, CLI, health, alert, and TUI automation uses sanitized hook
+  fixtures, fake clocks, and temporary config/data paths. It never launches
+  `vibe`, reads `~/.vibe` state, or contacts Mistral. Live authenticated Vibe
+  rendering remains an advisory unclaimed manual release gate.
 
 ## Failure modes
 
@@ -557,9 +603,21 @@ visible as partial; empty observations do not fabricate zero usage.
    `/usage` scraping, headless prompts, Antigravity settings/history discovery,
    and direct Google APIs. Those alternatives are unstable, consume quota, or
    cross credential/product boundaries.
+6. **Mistral Vibe acquisition. Chosen: documented bounded hook-payload
+   ingestion via Vibe's `post_llm` hook.** It is the only bounded stdin-JSON feed
+   Vibe exposes; it carries token usage but no server quota windows or resets.
+   Rejected: direct Mistral billing/usage HTTP calls (dashboard boundary:
+   no provider HTTP or credential handling), reading `~/.vibe` session logs,
+   caches, or `meta.json` (transcript/history/identity boundary), and a
+   speculative status-line contract Vibe does not implement.
 
 ## Verified facts, assumptions, and sources
 
+Verified from the shipped Mistral Vibe 3.1.3 installation (`vibe config schema`
+and bundled built-ins): Vibe implements no status line; its hook system supplies
+one JSON document per `post_llm` boundary carrying `usage` token counters and
+must run a user-configured command. Vibe's billing-derived monthly usage gauge
+is internal to the CLI footer and is not exposed through any local interface.
 Verified from official documentation/upstream source: the Codex handshake ordering,
 newline JSON transport, method name and response window fields; sparse update
 semantics; Claude stdin/status-line execution model, update/cancellation behavior,
@@ -579,6 +637,8 @@ Sources consulted (accessed 2026-09-20):
 - OpenAI, **Codex App Server**: https://developers.openai.com/codex/app-server/
 - OpenAI upstream account protocol source:
   https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/account.rs
+- Mistral AI, **Vibe CLI hooks configuration**:
+  https://docs.mistral.ai/vibe/code/cli/commands-shortcuts
 - Anthropic, **Customize your status line**:
   https://code.claude.com/docs/en/statusline
 - Google, **Antigravity status-line customization**:

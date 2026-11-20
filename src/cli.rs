@@ -25,6 +25,10 @@ use crate::{
         },
         codex::{CodexAdapter, CodexError},
         github_copilot::{CopilotAdapter, CopilotError, CopilotObservation},
+        vibe::{
+            MAX_STATUS_INPUT_BYTES as VIBE_MAX_STATUS_INPUT_BYTES, VibeParseError,
+            parse_hook_payload as parse_vibe_hook_payload,
+        },
     },
     status_line_relay::{self, CapturedInput},
     storage::{Storage, StorageError},
@@ -59,6 +63,12 @@ pub struct Cli {
     /// Google Antigravity observations become stale after this many seconds.
     #[arg(long, global = true)]
     pub antigravity_stale_after_seconds: Option<u64>,
+    /// Mistral Vibe observations become stale after this many seconds.
+    #[arg(long, global = true)]
+    pub vibe_stale_after_seconds: Option<u64>,
+    /// Context window size in tokens used to turn Vibe usage into percentages.
+    #[arg(long, global = true)]
+    pub vibe_context_window: Option<u64>,
     /// Local snapshot and alert retention in days.
     #[arg(long, global = true)]
     pub retention_days: Option<u32>,
@@ -145,6 +155,8 @@ pub enum IngestCommand {
     Claude,
     /// Read exactly one Google Antigravity status-line JSON object from stdin.
     Antigravity,
+    /// Read exactly one Mistral Vibe `post_llm` hook payload from stdin.
+    Vibe,
 }
 
 #[derive(Debug, Subcommand)]
@@ -213,6 +225,8 @@ pub enum CliError {
     Claude(#[from] ClaudeParseError),
     #[error("Google Antigravity ingestion failed: {class}")]
     AntigravityIngest { class: &'static str },
+    #[error("Mistral Vibe ingestion failed: {class}")]
+    VibeIngest { class: &'static str },
     #[error(transparent)]
     Codex(#[from] CodexError),
     #[error("GitHub Copilot refresh failed: {class}")]
@@ -318,6 +332,21 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
                 Storage::open_with_busy_timeout(paths.database_path(), Duration::from_millis(500))?;
             let now = now_millis()?;
             ingest_antigravity(
+                &storage,
+                io::stdin().lock(),
+                io::stdout().lock(),
+                now,
+                &config,
+            )?;
+            Ok(())
+        }
+        Command::Ingest {
+            provider: IngestCommand::Vibe,
+        } => {
+            let storage =
+                Storage::open_with_busy_timeout(paths.database_path(), Duration::from_millis(500))?;
+            let now = now_millis()?;
+            ingest_vibe(
                 &storage,
                 io::stdin().lock(),
                 io::stdout().lock(),
@@ -433,6 +462,12 @@ fn merged_config(mut config: AppConfig, cli: &Cli) -> Result<AppConfig, CliError
     }
     if let Some(value) = cli.antigravity_stale_after_seconds {
         config.antigravity_stale_after_seconds = value;
+    }
+    if let Some(value) = cli.vibe_stale_after_seconds {
+        config.vibe_stale_after_seconds = value;
+    }
+    if let Some(value) = cli.vibe_context_window {
+        config.vibe_context_window = value;
     }
     if let Some(value) = cli.retention_days {
         config.retention_days = value;
@@ -660,6 +695,77 @@ fn persist_antigravity_capture(
 fn antigravity_ingest_error(storage: &Storage, attempted_at: i64, class: &'static str) -> CliError {
     let _ = storage.record_provider_failure(Provider::GoogleAntigravity, attempted_at, class);
     CliError::AntigravityIngest { class }
+}
+
+fn ingest_vibe<R: Read, W: Write>(
+    storage: &Storage,
+    reader: R,
+    mut writer: W,
+    observed_at: i64,
+    config: &AppConfig,
+) -> Result<Vec<QuotaSnapshot>, CliError> {
+    storage
+        .record_provider_attempt(Provider::MistralVibe, observed_at)
+        .map_err(|_| vibe_ingest_error(storage, observed_at, "storage"))?;
+
+    let mut input = Vec::new();
+    if reader
+        .take((VIBE_MAX_STATUS_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut input)
+        .is_err()
+    {
+        return Err(vibe_ingest_error(storage, observed_at, "parse"));
+    }
+    let parse = match parse_vibe_hook_payload(&input, observed_at, config.vibe_context_window) {
+        Ok(observation) => observation,
+        Err(error) => {
+            return Err(vibe_ingest_error(
+                storage,
+                observed_at,
+                vibe_error_class(error),
+            ));
+        }
+    };
+    let batch = normalize_rows(parse.snapshots);
+    let rejected = parse.rejected_usages.saturating_add(batch.rejected.len());
+    if batch.accepted.is_empty() && rejected > 0 {
+        return Err(vibe_ingest_error(storage, observed_at, "parse"));
+    }
+    storage
+        .insert_snapshots(&batch.accepted)
+        .map_err(|_| vibe_ingest_error(storage, observed_at, "storage"))?;
+    storage
+        .record_provider_success(Provider::MistralVibe, observed_at)
+        .map_err(|_| vibe_ingest_error(storage, observed_at, "storage"))?;
+    writeln!(
+        writer,
+        "Mistral Vibe: accepted {}, rejected {}",
+        batch.accepted.len(),
+        rejected
+    )?;
+    finish_observation(
+        storage,
+        &batch.accepted,
+        config,
+        observed_at,
+        &mut writer,
+        false,
+    )?;
+    Ok(batch.accepted)
+}
+
+fn vibe_error_class(error: VibeParseError) -> &'static str {
+    match error {
+        VibeParseError::Oversized => "oversize",
+        VibeParseError::InvalidDocument
+        | VibeParseError::UnexpectedEvent
+        | VibeParseError::InvalidContextWindow => "parse",
+    }
+}
+
+fn vibe_ingest_error(storage: &Storage, attempted_at: i64, class: &'static str) -> CliError {
+    let _ = storage.record_provider_failure(Provider::MistralVibe, attempted_at, class);
+    CliError::VibeIngest { class }
 }
 
 fn record_antigravity_relay_failure(

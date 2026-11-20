@@ -1,11 +1,12 @@
 # Installation and agent setup
 
 This guide installs `agent-usage-dashboard` from a local checkout, makes the
-installed executable available to newly started processes, and connects the four
-supported agents: Codex, Claude Code, GitHub Copilot, and Google Antigravity.
+installed executable available to newly started processes, and connects the five
+supported agents: Codex, Claude Code, GitHub Copilot, Google Antigravity, and
+Mistral Vibe.
 
 The dashboard does not install or authenticate a provider CLI. Install and sign
-in to Codex, Claude Code, GitHub Copilot, or Antigravity using that tool's own instructions
+in to Codex, Claude Code, GitHub Copilot, Antigravity, or Mistral Vibe using that tool's own instructions
 first. The dashboard also never edits shell profiles, `PATH`, Claude settings,
 or provider authentication automatically; every persistent change below is an
 explicit command or edit you control.
@@ -24,6 +25,8 @@ explicit command or edit you control.
 - For Antigravity data, the official `agy` CLI authenticated by the user. Google
   ended consumer-tier Gemini CLI access on June 18, 2026, so the dashboard does
   not implement a Gemini CLI provider.
+- For Mistral Vibe data, Mistral Vibe 3.1.0 or newer with a configured
+  `post_llm` hook (set up below).
 
 The Copilot SDK's default feature downloads and embeds a version-matched runtime
 and supporting assets during the build. Expect the initial build/download and
@@ -583,6 +586,83 @@ Troubleshooting:
   fabricate or delete snapshots.
 - If either executable is missing, restart the terminal and Antigravity, verify
   `PATH`, then use the dashboard's absolute-path JSON form.
+
+## Mistral Vibe setup
+
+Mistral Vibe has no status-line feature. Instead, Vibe's hook system can run a
+command with one JSON document on standard input after every model call. The
+dashboard's `ingest vibe` command parses that hook payload the same bounded way
+as `ingest claude` and `ingest antigravity`.
+
+### Configure the hook
+
+Add one hook to `~/.vibe/hooks.toml` (or a trusted project's
+`.vibe/hooks.toml`):
+
+```toml
+[[hooks]]
+name = "agent-usage-dashboard"
+type = "post_llm"
+command = "agent-usage-dashboard ingest vibe"
+```
+
+Vibe runs the command once per model call, including subagent calls. If
+`agent-usage-dashboard` is not on the hook environment's `PATH`, use the
+absolute executable path in `command`. To share one private database with the
+interactive dashboard, place the global option before the subcommand:
+
+```text
+agent-usage-dashboard --data-dir "/absolute/private/path" ingest vibe
+```
+
+The hook payload itself is never persisted. The parser reads only
+`hook_event_name`, an optional `model` alias used as the shown scope, and the
+`usage.total_tokens` counter; session and conversation identifiers, transcript
+paths, prompts, responses, and every other field are discarded before anything
+is stored. Back up and review existing hooks before editing.
+
+The persisted `vibe_stale_after_seconds` setting defaults to 900 and accepts 60
+through 86,400. An explicit override also precedes the subcommand:
+
+```text
+agent-usage-dashboard --vibe-stale-after-seconds 600 ingest vibe
+```
+
+### What the panel shows
+
+Vibe does not publish quota windows the way Codex, Copilot, Claude, or
+Antigravity do, so the Mistral Vibe panel reports context usage: the last call's
+total token count as a percentage of the model context window in
+`vibe_context_window` (default 262144 tokens, accepted range 4096 through
+10,000,000). There is no reset time; rows are therefore marked partial and the
+panel goes stale after the configured staleness window. Concurrency note: the
+hook fires per session and per subagent, so the latest call wins and the panel
+reflects the most recently active session.
+
+```text
+agent-usage-dashboard --vibe-context-window 600000 ingest vibe
+```
+
+### Verify and troubleshoot Vibe ingestion
+
+1. Confirm `vibe --version` (3.1.0 or newer) and `agent-usage-dashboard --version`
+   resolve in a newly opened terminal, then restart Vibe.
+2. Run one turn in Vibe, then `agent-usage-dashboard history --limit 10` and
+   confirm a `Mistral Vibe` row appears.
+3. Check the dashboard shows the Mistral Vibe panel with a fresh usage bar.
+
+Troubleshooting:
+
+- `oversize` means the payload exceeded 1 MiB and was not ingested.
+- `parse` means the payload was not one JSON object, not a `post_llm` event, its
+  `usage` object was unusable, or the model alias was rejected. Non-secret
+  fields are never echoed in errors.
+- `Mistral Vibe: accepted 0, rejected 0` means Vibe reported no usage for that
+  call; the observation is still recorded as healthy. When the provider reports
+  no usage at all, the dashboard records health without fabricating snapshots.
+- Stale rows mean no recent `post_llm` call; either Vibe was idle or the hook
+  did not run. Check `vibe /log-level DEBUG` output and the hooks file location
+  (project `.vibe/hooks.toml` runs before `~/.vibe/hooks.toml`).
 
 ## Settings and argument safety
 

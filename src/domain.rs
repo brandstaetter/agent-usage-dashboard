@@ -50,6 +50,7 @@ pub enum Provider {
     Claude,
     GitHubCopilot,
     GoogleAntigravity,
+    MistralVibe,
 }
 
 impl Provider {
@@ -59,6 +60,7 @@ impl Provider {
             Self::Claude => "claude",
             Self::GitHubCopilot => "github_copilot",
             Self::GoogleAntigravity => "google_antigravity",
+            Self::MistralVibe => "mistral_vibe",
         }
     }
 }
@@ -70,6 +72,7 @@ impl fmt::Display for Provider {
             Self::Claude => "Claude",
             Self::GitHubCopilot => "GitHub Copilot",
             Self::GoogleAntigravity => "Google AI · Antigravity",
+            Self::MistralVibe => "Mistral Vibe",
         })
     }
 }
@@ -83,6 +86,7 @@ impl FromStr for Provider {
             "claude" => Ok(Self::Claude),
             "github_copilot" => Ok(Self::GitHubCopilot),
             "google_antigravity" => Ok(Self::GoogleAntigravity),
+            "mistral_vibe" => Ok(Self::MistralVibe),
             _ => Err(ParseEnumError {
                 enum_name: "Provider",
                 value: value.to_owned(),
@@ -364,6 +368,12 @@ mod tests {
             Provider::GoogleAntigravity.to_string(),
             "Google AI · Antigravity"
         );
+        assert_eq!(
+            "mistral_vibe".parse::<Provider>().unwrap(),
+            Provider::MistralVibe
+        );
+        assert_eq!(Provider::MistralVibe.as_str(), "mistral_vibe");
+        assert_eq!(Provider::MistralVibe.to_string(), "Mistral Vibe");
         assert_eq!(
             "rolling_5h".parse::<WindowKind>().unwrap(),
             WindowKind::Rolling5h

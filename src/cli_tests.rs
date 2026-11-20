@@ -20,6 +20,7 @@ use super::*;
 use crate::domain::{Availability, LimitKind, Provider, Quality, WindowKind};
 use crate::providers::codex::CodexObservation;
 use crate::providers::github_copilot::{CopilotError, CopilotObservation, CopilotPhase};
+use crate::providers::vibe::MAX_STATUS_INPUT_BYTES as VIBE_MAX_STATUS_INPUT_BYTES;
 
 #[test]
 fn parses_commands_global_data_dir_and_custom_codex_path() {
@@ -115,6 +116,8 @@ fn config_persistence_cli_applies_only_explicit_overrides() {
         copilot_refresh_seconds: 300,
         claude_stale_after_seconds: 2_400,
         antigravity_stale_after_seconds: 3_000,
+        vibe_stale_after_seconds: 3_600,
+        vibe_context_window: 262_144,
         retention_days: 90,
         low_remaining_percent: 7.5,
         reset_soon_seconds: 180,
@@ -1111,4 +1114,118 @@ fn successful_claude_ingest_evaluates_alerts_and_history_without_raw_input() {
     assert!(!history_output.contains(&now.to_string()));
     assert!(!history_output.contains(&reset.to_string()));
     assert!(!history_output.contains("discard"));
+}
+
+#[test]
+fn direct_vibe_ingest_persists_usage_and_success_health() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::open(temp.path().join("usage.sqlite3")).unwrap();
+    let observed_at = 1_700_000_000_000;
+    let mut output = Vec::new();
+    let payload = br#"{
+        "hook_event_name": "post_llm",
+        "session_id": "do-not-persist-session",
+        "transcript_path": "do-not-persist-transcript",
+        "model": "mistral-medium-3-5",
+        "response_text": "do-not-persist-response",
+        "usage": {"input_tokens": 1000, "output_tokens": 250, "total_tokens": 1250}
+    }"#;
+
+    let snapshots = ingest_vibe(
+        &storage,
+        payload.as_slice(),
+        &mut output,
+        observed_at,
+        &AppConfig::default(),
+    )
+    .unwrap();
+
+    assert_eq!(snapshots.len(), 1);
+    let rows = storage.latest_snapshots().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].snapshot.as_input().provider, Provider::MistralVibe);
+    assert_eq!(rows[0].snapshot.as_input().scope_key, "mistral-medium-3-5");
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("Mistral Vibe: accepted 1, rejected 0"));
+    assert!(!output.contains("do-not-persist"));
+    let database = fs::read(temp.path().join("usage.sqlite3")).unwrap();
+    for secret in [
+        "do-not-persist-session",
+        "do-not-persist-transcript",
+        "do-not-persist-response",
+    ] {
+        assert!(
+            !database
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "database must not contain {secret}"
+        );
+    }
+    let health = storage
+        .provider_state(Provider::MistralVibe)
+        .unwrap()
+        .unwrap();
+    assert_eq!(health.last_attempt_at, Some(observed_at));
+    assert_eq!(health.last_success_at, Some(observed_at));
+    assert_eq!(health.consecutive_failures, 0);
+}
+
+#[test]
+fn direct_vibe_failures_are_sanitized_and_record_approved_classes() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::open(temp.path().join("usage.sqlite3")).unwrap();
+    let observed_at = 1_700_000_000_000;
+
+    let sentinel = br#"{"private":"do-not-echo"} trailing"#;
+    let parse_error = ingest_vibe(
+        &storage,
+        sentinel.as_slice(),
+        Vec::new(),
+        observed_at,
+        &AppConfig::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        parse_error,
+        CliError::VibeIngest { class: "parse" }
+    ));
+    assert!(!parse_error.to_string().contains("do-not-echo"));
+
+    let oversized = vec![b'x'; VIBE_MAX_STATUS_INPUT_BYTES + 1];
+    let oversize_error = ingest_vibe(
+        &storage,
+        oversized.as_slice(),
+        Vec::new(),
+        observed_at + 1,
+        &AppConfig::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        oversize_error,
+        CliError::VibeIngest { class: "oversize" }
+    ));
+
+    let wrong_window = AppConfig {
+        vibe_context_window: 1,
+        ..AppConfig::default()
+    };
+    let window_error = ingest_vibe(
+        &storage,
+        br#"{"hook_event_name": "post_llm", "usage": {"total_tokens": 1}}"#.as_slice(),
+        Vec::new(),
+        observed_at + 2,
+        &wrong_window,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        window_error,
+        CliError::VibeIngest { class: "parse" }
+    ));
+
+    let health = storage
+        .provider_state(Provider::MistralVibe)
+        .unwrap()
+        .unwrap();
+    assert_eq!(health.consecutive_failures, 3);
+    assert_eq!(health.last_error_class.as_deref(), Some("parse"));
 }

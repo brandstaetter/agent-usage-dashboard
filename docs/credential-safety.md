@@ -47,12 +47,18 @@ Antigravity invokes the user-configured status-line command and supplies one JSO
 
 Authentication and Google network access remain entirely under `agy` control. The user launches `agy` and completes its browser/keyring sign-in. The dashboard does not open Antigravity settings, inspect the OS keyring, scan environment credentials, invoke authentication, or contact Google. Raw status JSON exists briefly in bounded process memory and, in relay mode, is also passed to the user-selected formatter before being discarded.
 
+### Mistral Vibe: bounded hook-payload input
+
+Mistral Vibe has no status-line feature. The user configures a Vibe `post_llm` hook that runs `ingest vibe`, and Vibe supplies one JSON object on standard input after each model call. `ingest vibe` accepts at most 1 MiB, inspects only `hook_event_name`, an optional `model` alias used as the shown scope key, and `usage.total_tokens`, then discards the input. The dashboard never reads, retains, or stores Vibe session or conversation identifiers, transcript paths, working directory, prompts, responses, or any other payload field, and never opens `~/.vibe` configuration, session logs, or history files.
+
+Authentication and Mistral network access remain entirely under Vibe control. The dashboard does not read `~/.vibe/.env` or any other credential source, does not call Mistral API endpoints, and does not query Vibe's billing-derived usage gauge. Raw hook JSON exists briefly in bounded process memory before it is discarded.
+
 ## What is stored
 
 `usage.sqlite3` contains only normalized operational records. The snapshot allowlist is:
 
 - `id`: a local SQLite row ID;
-- `provider`: `codex`, `claude`, `github_copilot`, or `google_antigravity`;
+- `provider`: `codex`, `claude`, `github_copilot`, `google_antigravity`, or `mistral_vibe`;
 - `scope_key`: a sanitized, non-account provider category/bucket key;
 - `window_kind`, `limit_kind`, and `window_duration_seconds`: the classified rolling, spend, monthly, or other window; its `limited`/`unlimited` state; and its optional duration;
 - `used_percent`: the validated normalized used percentage for a finite allowance (unlimited rows retain an explicit limit classification rather than presenting this as consumption);
@@ -67,7 +73,7 @@ The database also keeps bounded operational state:
 - Provider health: `provider`, `last_success_at`, `last_attempt_at`, `consecutive_failures`, and `last_error_class`. Raw error text is not stored.
 - Alert deduplication: `provider`, `scope_key`, `window_kind`, `alert_kind`, `cycle_key`, and `fired_at`.
 
-The dashboard configuration file is separate from SQLite. Its complete allowlist is `codex_refresh_seconds`, `copilot_refresh_seconds`, `claude_stale_after_seconds`, `antigravity_stale_after_seconds`, `retention_days`, `low_remaining_percent`, `reset_soon_seconds`, `native_notifications`, and the provider-key arrays `provider_preferences.order` and `provider_preferences.hidden`. The preference arrays control presentation only. The file has no fields for provider credentials, runtime paths, or provider authentication. Antigravity's stale threshold defaults to 900 seconds and is bounded to 60–86,400 seconds.
+The dashboard configuration file is separate from SQLite. Its complete allowlist is `codex_refresh_seconds`, `copilot_refresh_seconds`, `claude_stale_after_seconds`, `antigravity_stale_after_seconds`, `vibe_stale_after_seconds`, `vibe_context_window`, `retention_days`, `low_remaining_percent`, `reset_soon_seconds`, `native_notifications`, and the provider-key arrays `provider_preferences.order` and `provider_preferences.hidden`. The preference arrays control presentation only. The file has no fields for provider credentials, runtime paths, or provider authentication. The Antigravity and Vibe stale thresholds default to 900 seconds and are bounded to 60–86,400 seconds. `vibe_context_window` is a token-count denominator (4096–10,000,000) used to express Vibe usage as a percentage; it contains no secrets.
 
 ## What is excluded
 
@@ -77,12 +83,12 @@ The dashboard does not read provider auth/config files, keychains, browser profi
 - browser cookies or browser storage;
 - prompts, responses, transcripts, conversations, or message histories;
 - account, user, email, conversation, project, organization, or repository identifiers;
-- raw Codex responses, raw Claude or Antigravity status-line payloads, or raw Copilot quota/RPC payloads;
+- raw Codex responses, raw Claude, Antigravity, or Mistral Vibe status/hook payloads, or raw Copilot quota/RPC payloads;
 - provider configuration or provider history;
 - Codex child stderr or wrapped formatter stderr; or
 - unknown provider fields and raw error bodies.
 
-There is no direct provider HTTP client in the dashboard, no remote synchronization or cloud dashboard service, and no listening HTTP, socket, or other network ingestion server. Acquisition is limited to the directly spawned Codex stdio child, explicit Claude Code and Antigravity status-line invocations, and the provider-owned Copilot runtime's local stdio RPC. Provider-owned processes—not the dashboard—own authentication and upstream network traffic.
+There is no direct provider HTTP client in the dashboard, no remote synchronization or cloud dashboard service, and no listening HTTP, socket, or other network ingestion server. Acquisition is limited to the directly spawned Codex stdio child, explicit Claude Code and Antigravity status-line invocations, explicit Mistral Vibe hook invocations, and the provider-owned Copilot runtime's local stdio RPC. Provider-owned processes—not the dashboard—own authentication and upstream network traffic.
 
 ## Residual privacy risks
 
@@ -90,7 +96,7 @@ There is no direct provider HTTP client in the dashboard, no remote synchronizat
 - **Usage and timestamps are still personal operational data.** They can reveal when a provider was used, quota consumption patterns, reset schedules, provider health, and alert activity even though they contain no prompt text or account identifier.
 - **Terminal and notification text can be observed.** Screenshots, scrollback, screen sharing, terminal capture, native notification history, and people near the display may expose usage and reset information.
 - **Configured executables are trusted local programs.** The selected Codex executable runs under your account and controls its own authentication. A wrapped Claude or Antigravity formatter receives the full original status-line value. PATH replacement or an untrusted executable can exceed the dashboard's privacy boundary.
-- **Raw status input exists briefly in memory.** Claude and Antigravity documents are bounded, parsed once, and discarded, but could still appear in process memory or a crash dump. Relay mode necessarily gives the complete document to the formatter you selected.
+- **Raw status input exists briefly in memory.** Claude, Antigravity, and Mistral Vibe documents are bounded, parsed once, and discarded, but could still appear in process memory or a crash dump. Relay mode necessarily gives the complete document to the formatter you selected.
 - **The bundled or overridden Copilot runtime is trusted provider code.** It runs with your local user permissions, may access its own credential store and network, and is larger than the dashboard-only code. An exact runtime override expands this trust decision.
 - **Copilot quota keys can evolve.** Category keys are runtime-defined. The dashboard validates and stores bounded keys, but an SDK/runtime upgrade can add, remove, or rename categories and change what appears in history.
 - **Local deletion is not secure erasure.** SQLite pages, WAL/SHM files, filesystem snapshots, backups, crash dumps, and storage-device behavior may retain older bytes after records or files are deleted.

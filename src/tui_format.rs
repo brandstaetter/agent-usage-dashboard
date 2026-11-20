@@ -11,6 +11,7 @@ pub(super) fn provider_label(provider: Provider) -> &'static str {
         Provider::Claude => "Claude",
         Provider::GitHubCopilot => "GitHub Copilot",
         Provider::GoogleAntigravity => "Google AI · Antigravity",
+        Provider::MistralVibe => "Mistral Vibe",
     }
 }
 

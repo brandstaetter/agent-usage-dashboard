@@ -16,6 +16,10 @@ pub const MIN_CLAUDE_STALE_SECONDS: u64 = 60;
 pub const MAX_CLAUDE_STALE_SECONDS: u64 = 24 * 60 * 60;
 pub const MIN_ANTIGRAVITY_STALE_SECONDS: u64 = 60;
 pub const MAX_ANTIGRAVITY_STALE_SECONDS: u64 = 24 * 60 * 60;
+pub const MIN_VIBE_STALE_SECONDS: u64 = 60;
+pub const MAX_VIBE_STALE_SECONDS: u64 = 24 * 60 * 60;
+pub const MIN_VIBE_CONTEXT_WINDOW: u64 = 4_096;
+pub const MAX_VIBE_CONTEXT_WINDOW: u64 = 10_000_000;
 pub const MIN_RETENTION_DAYS: u32 = 1;
 pub const MAX_RETENTION_DAYS: u32 = 3_650;
 pub const MIN_RESET_SOON_SECONDS: u64 = 60;
@@ -32,6 +36,10 @@ pub struct AppConfig {
     pub claude_stale_after_seconds: u64,
     #[serde(default = "default_antigravity_stale_after_seconds")]
     pub antigravity_stale_after_seconds: u64,
+    #[serde(default = "default_vibe_stale_after_seconds")]
+    pub vibe_stale_after_seconds: u64,
+    #[serde(default = "default_vibe_context_window")]
+    pub vibe_context_window: u64,
     pub retention_days: u32,
     pub low_remaining_percent: f64,
     pub reset_soon_seconds: u64,
@@ -101,6 +109,8 @@ impl Default for AppConfig {
             copilot_refresh_seconds: default_copilot_refresh_seconds(),
             claude_stale_after_seconds: 15 * 60,
             antigravity_stale_after_seconds: default_antigravity_stale_after_seconds(),
+            vibe_stale_after_seconds: default_vibe_stale_after_seconds(),
+            vibe_context_window: default_vibe_context_window(),
             retention_days: 30,
             low_remaining_percent: 20.0,
             reset_soon_seconds: 10 * 60,
@@ -135,6 +145,18 @@ impl AppConfig {
             self.antigravity_stale_after_seconds,
             MIN_ANTIGRAVITY_STALE_SECONDS,
             MAX_ANTIGRAVITY_STALE_SECONDS,
+        )?;
+        validate_range(
+            "vibe_stale_after_seconds",
+            self.vibe_stale_after_seconds,
+            MIN_VIBE_STALE_SECONDS,
+            MAX_VIBE_STALE_SECONDS,
+        )?;
+        validate_range(
+            "vibe_context_window",
+            self.vibe_context_window,
+            MIN_VIBE_CONTEXT_WINDOW,
+            MAX_VIBE_CONTEXT_WINDOW,
         )?;
         validate_range(
             "retention_days",
@@ -205,6 +227,14 @@ const fn default_copilot_refresh_seconds() -> u64 {
 
 const fn default_antigravity_stale_after_seconds() -> u64 {
     15 * 60
+}
+
+const fn default_vibe_stale_after_seconds() -> u64 {
+    15 * 60
+}
+
+const fn default_vibe_context_window() -> u64 {
+    262_144
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

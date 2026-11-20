@@ -28,6 +28,8 @@ fn config_persistence_round_trip_contains_only_dashboard_settings() {
         copilot_refresh_seconds: 600,
         claude_stale_after_seconds: 1_200,
         antigravity_stale_after_seconds: 1_800,
+        vibe_stale_after_seconds: 1_800,
+        vibe_context_window: 262_144,
         retention_days: 45,
         low_remaining_percent: 12.5,
         reset_soon_seconds: 300,
@@ -212,6 +214,79 @@ fn config_persistence_validates_antigravity_staleness_inclusive_bounds() {
                 min: MIN_ANTIGRAVITY_STALE_SECONDS,
                 max: MAX_ANTIGRAVITY_STALE_SECONDS,
                 actual,
+            } if actual == rejected
+        ));
+    }
+}
+
+#[test]
+fn config_persistence_defaults_vibe_settings_for_legacy_files() {
+    let source = AppConfig::default()
+        .to_toml()
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            !line.starts_with("vibe_stale_after_seconds")
+                && !line.starts_with("vibe_context_window")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config: AppConfig = toml::from_str(&source).unwrap();
+    assert_eq!(config.vibe_stale_after_seconds, 900);
+    assert_eq!(config.vibe_context_window, 262_144);
+}
+
+#[test]
+fn config_persistence_validates_vibe_staleness_inclusive_bounds() {
+    for accepted in [MIN_VIBE_STALE_SECONDS, MAX_VIBE_STALE_SECONDS] {
+        AppConfig {
+            vibe_stale_after_seconds: accepted,
+            ..AppConfig::default()
+        }
+        .validate()
+        .unwrap();
+    }
+    for rejected in [MIN_VIBE_STALE_SECONDS - 1, MAX_VIBE_STALE_SECONDS + 1] {
+        let error = AppConfig {
+            vibe_stale_after_seconds: rejected,
+            ..AppConfig::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::OutOfRange {
+                field: "vibe_stale_after_seconds",
+                actual,
+                ..
+            } if actual == rejected
+        ));
+    }
+}
+
+#[test]
+fn config_persistence_validates_vibe_context_window_inclusive_bounds() {
+    for accepted in [MIN_VIBE_CONTEXT_WINDOW, MAX_VIBE_CONTEXT_WINDOW] {
+        AppConfig {
+            vibe_context_window: accepted,
+            ..AppConfig::default()
+        }
+        .validate()
+        .unwrap();
+    }
+    for rejected in [MIN_VIBE_CONTEXT_WINDOW - 1, MAX_VIBE_CONTEXT_WINDOW + 1] {
+        let error = AppConfig {
+            vibe_context_window: rejected,
+            ..AppConfig::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::OutOfRange {
+                field: "vibe_context_window",
+                actual,
+                ..
             } if actual == rejected
         ));
     }
